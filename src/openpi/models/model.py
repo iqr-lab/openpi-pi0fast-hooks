@@ -14,13 +14,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
+import safetensors
+import torch
 
+from openpi.models_pytorch import pi0_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
 
 logger = logging.getLogger("openpi")
 
-ArrayT = TypeVar("ArrayT", at.Array, jax.ShapeDtypeStruct)
+# Type variable for array types (JAX arrays, PyTorch tensors, or numpy arrays)
+ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
 
 
 class ModelType(enum.Enum):
@@ -28,6 +32,7 @@ class ModelType(enum.Enum):
 
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
+    PI05 = "pi05"
 
 
 # The model always expects these images
@@ -101,6 +106,13 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # pi0.5 debug recording fields (optional).
+    # When the tokenized_prompt contains concatenated task+state tokens (discrete_state_input=True),
+    # these lengths allow splitting them for per-modality attribution.
+    # pytree_node=False keeps them as plain Python ints (static) so JAX jit doesn't trace them.
+    task_token_len: int | None = struct.field(pytree_node=False, default=None)
+    state_token_len: int | None = struct.field(pytree_node=False, default=None)
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -111,6 +123,16 @@ class Observation(Generic[ArrayT]):
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
+                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        # task_token_len, state_token_len, and piece arrays are static metadata
+        # (pytree_node=False). Policy.infer batches all dict values via jax.tree.map
+        # → JAX arrays with a leading batch dim; convert back to plain Python/numpy.
+        def _to_python_int(val) -> int | None:
+            if val is None:
+                return None
+            return int(np.asarray(val).ravel()[0])
+
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -119,6 +141,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            task_token_len=_to_python_int(data.get("task_token_len")),
+            state_token_len=_to_python_int(data.get("state_token_len")),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -198,6 +222,8 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        task_token_len=observation.task_token_len,
+        state_token_len=observation.state_token_len,
     )
 
 
@@ -233,6 +259,12 @@ class BaseModelConfig(abc.ABC):
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 
+    def load_pytorch(self, train_config, weight_path: str):
+        logger.info(f"train_config: {train_config}")
+        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        safetensors.torch.load_model(model, weight_path)
+        return model
+
     @abc.abstractmethod
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[Observation, Actions]:
         """Returns the input specification for the model. Values are jax.ShapeDtypeStruct."""
@@ -267,7 +299,7 @@ class BaseModel(nnx.Module, abc.ABC):
     ) -> at.Float[at.Array, "*b ah"]: ...
 
     @abc.abstractmethod
-    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions: ...
+    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
 
 
 def restore_params(
@@ -291,9 +323,7 @@ def restore_params(
     Returns:
         The restored params.
     """
-    params_path = pathlib.Path(params_path).resolve()
-    if not params_path.exists():
-        raise FileNotFoundError(f"Model params not found at: {params_path}")
+    params_path = pathlib.Path(params_path).resolve() if not str(params_path).startswith("gs://") else params_path
 
     if restore_type is jax.Array and sharding is None:
         mesh = jax.sharding.Mesh(jax.devices(), ("x",))

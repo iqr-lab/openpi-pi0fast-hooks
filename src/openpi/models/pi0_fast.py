@@ -1,6 +1,6 @@
 import dataclasses
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import einops
 import flax.nnx as nnx
@@ -14,6 +14,8 @@ import openpi.models.gemma_fast as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+
+from pi0fast_hooks.runtime import collect_hook_data
 
 logger = logging.getLogger("openpi")
 
@@ -97,6 +99,7 @@ class Pi0FASTConfig(_model.BaseModelConfig):
     def create(self, rng: at.KeyArrayLike) -> "Pi0FAST":
         return Pi0FAST(self, rngs=nnx.Rngs(rng))
 
+
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
@@ -117,6 +120,19 @@ class Pi0FASTConfig(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+
+                task_token_len=jax.ShapeDtypeStruct([], jnp.int32),
+                state_token_len=jax.ShapeDtypeStruct([], jnp.int32),
+
+                task_piece_id=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
+                task_piece_begin=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
+                task_piece_end=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
+
+                
+                state_piece_id=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
+                state_piece_begin=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
+                state_piece_end=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
+
                 token_ar_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 token_loss_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.bool_),
             )
@@ -124,11 +140,22 @@ class Pi0FASTConfig(_model.BaseModelConfig):
 
         return observation_spec, action_spec
 
+
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
         if "lora" in self.paligemma_variant:
             return nnx.All(nnx_utils.PathRegex(".*llm.*"), nnx.Not(nnx_utils.PathRegex(".*lora.*")))
         return nnx.Nothing
+
+
+@dataclasses.dataclass
+class Modality:
+    name: str # "img/front", "text", "state"
+    type: str # "image", "text", "state"
+    embedding: at.Array # (B, S, D)
+    input_mask: at.Array # (B, S)
+    ar_mask: at.Array # (B, S)
+    meta: Optional[dict[str, Any]] = None # slices, grid
 
 
 class Pi0FAST(_model.BaseModel):
@@ -193,6 +220,142 @@ class Pi0FAST(_model.BaseModel):
             jnp.concatenate(input_mask, axis=1),
             jnp.concatenate(ar_mask, axis=1),
         )
+    
+    def get_patch_grid(self, img_token_embeddings, img_out: dict) -> tuple[int, int]:
+        Hp, Wp = (None, None)
+
+        if isinstance(img_out, dict) and "pre_logits_2d" in img_out:
+            Hp, Wp = int(img_out["pre_logits_2d"].shape[1]), int(img_out["pre_logits_2d"].shape[2])
+        elif isinstance(img_out, dict) and "stem" in img_out:
+            Hp, Wp = int(img_out["stem"].shape[1]), int(img_out["stem"].shape[2])
+        else:
+            Hp = int(jnp.sqrt(img_token_embeddings.shape[1]))
+            Wp = int(img_token_embeddings.shape[1] // Hp)
+        
+        return Hp, Wp
+
+
+    def build_image_modality(self, obs: _model.Observation) -> list[Modality]:
+        image_modality: list[Modality] = []
+
+        for name in obs.images:
+            image_token_embeddings, img_out = self.PaliGemma.img(obs.images[name], train=False)
+            input_mask = einops.repeat(
+                    obs.image_masks[name],
+                    "b -> b s",
+                    s=image_token_embeddings.shape[1],
+                )
+
+            ar_mask = jnp.zeros_like(input_mask, dtype=jnp.int32)  # non-autoregressive
+            grid = self.get_patch_grid(
+                img_token_embeddings=image_token_embeddings, 
+                img_out=img_out
+            )
+
+            image_modality.append(Modality(
+                name=name,
+                type="image",
+                embedding=image_token_embeddings,
+                input_mask=input_mask,
+                ar_mask=ar_mask,
+                meta={"grid": grid},
+            ))
+
+        return image_modality
+    
+    def build_full_text_modality(self, obs: _model.Observation) -> Modality:
+        assert obs.tokenized_prompt is not None, "Tokenized prompt is required"
+        assert obs.tokenized_prompt_mask is not None, "Tokenized prompt mask is required"
+        assert obs.token_ar_mask is not None, "Token auto-regressive mask is required"
+
+        tokenized_inputs_embeddings = self.PaliGemma.llm(obs.tokenized_prompt, embed_only=True)  # (B, S, D)
+
+        return Modality(
+            name="text",
+            type="text",
+            embedding=tokenized_inputs_embeddings,
+            input_mask=obs.tokenized_prompt_mask,
+            ar_mask=obs.token_ar_mask,
+            meta={}
+        )
+    
+    def build_task_modality(self, obs: _model.Observation, text_modality: Modality) -> Modality:
+        assert obs.task_token_len is not None, "task_token_len is required"
+        task_token_len = obs.task_token_len
+
+        return Modality(
+            name="task",
+            type="text",
+            embedding=text_modality.embedding[:, :task_token_len, :],
+            input_mask=text_modality.input_mask[:, :task_token_len],
+            ar_mask=text_modality.ar_mask[:, :task_token_len],
+            meta={}
+        )
+
+    def build_state_modality(
+        self,
+        obs: _model.Observation,
+        text_modality: Modality,
+    ) -> Modality:
+        task_len = obs.task_token_len
+        state_len = obs.state_token_len
+        end = task_len + state_len
+
+        return Modality(
+            name="state",
+            type="text",
+            embedding=text_modality.embedding[:, task_len:end, :],
+            input_mask=text_modality.input_mask[:, task_len:end],
+            ar_mask=text_modality.ar_mask[:, task_len:end],
+            meta={},
+        )
+
+
+    @at.typecheck
+    def embed_inputs_with_spans(self, obs: _model.Observation):
+        token_embeddings, input_masks, ar_masks = [], [], []
+        
+        image_modality = self.build_image_modality(obs)
+        full_text_modality = self.build_full_text_modality(obs)
+
+        task_modality = self.build_task_modality(obs, full_text_modality) # Name is 'task'
+        state_modality = self.build_state_modality(obs, full_text_modality) # Name is 'state'
+
+        modalities = image_modality + [task_modality, state_modality]
+
+        # modalities = image_modality + [full_text_modality]
+
+        spans = {"image": {}}
+        meta = {"image_grids": {}}
+        
+        cur = 0
+        for m in modalities:
+            token_embeddings.append(m.embedding)
+            input_masks.append(m.input_mask)
+            ar_masks.append(m.ar_mask)
+
+            start = cur
+            end = start + int(m.embedding.shape[1])
+            cur = end
+
+            # Spans
+            if m.type == "image":
+                spans["image"][m.name] = (start, end)
+            else:
+                # Possible m.name: "task" and "state"
+                spans[m.name] = (start, end)
+
+            # Image grids
+            if m.meta and "grid" in m.meta:
+                meta["image_grids"][m.name] = m.meta["grid"]
+
+        return (
+            jnp.concatenate(token_embeddings, axis=1),
+            jnp.concatenate(input_masks, axis=1),
+            jnp.concatenate(ar_masks, axis=1),
+            spans,
+            meta,
+        )
 
     @override
     def compute_loss(
@@ -247,67 +410,325 @@ class Pi0FAST(_model.BaseModel):
         )
 
         # embed inputs
-        prefix_token_embeddings, prefix_mask, prefix_ar_mask = self.embed_inputs(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_emb_unaligned, prefix_mask_unaligned, prefix_ar_mask_unaligned, spans, meta = \
+            self.embed_inputs_with_spans(observation)
+        prefix_attn_mask_unaligned = make_attn_mask(prefix_mask_unaligned, prefix_ar_mask_unaligned)
 
         # left to right align all input token sequences
-        prefix_token_embeddings, prefix_mask, prefix_attn_mask = left_to_right_align(
-            prefix_token_embeddings, prefix_mask, prefix_attn_mask
+        prefix_emb_aligned, prefix_mask_aligned, prefix_attn_mask_aligned = left_to_right_align(
+            prefix_emb_unaligned, prefix_mask_unaligned, prefix_attn_mask_unaligned
         )
-        prefill_size = prefix_token_embeddings.shape[1]
-        prefill_len = jnp.sum(prefix_mask, axis=-1)
+        prefill_size = prefix_emb_aligned.shape[1]
+        prefill_len = jnp.sum(prefix_mask_aligned, axis=-1)
         prefix_start = prefill_size - prefill_len
 
         # first fill KV cache with a forward pass of the prefix
         # pad attention mask to set the size of the KV cache (prefill_size + max_decoding_steps)
-        prefix_attn_mask = jnp.pad(prefix_attn_mask, ((0, 0), (0, 0), (0, max_decoding_steps)))
-        prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
+        prefix_attn_mask_aligned = jnp.pad(prefix_attn_mask_aligned, ((0, 0), (0, 0), (0, max_decoding_steps)))
+        prefix_positions = jnp.cumsum(prefix_mask_aligned, axis=-1) - 1
+
+        # Run the prefix prefill pass and allow Linen intermediates to be written.
         prefix_logits, kv_cache, _ = self.PaliGemma.llm(
-            embedded_prefix=prefix_token_embeddings, mask=prefix_attn_mask, positions=prefix_positions, decode=True
+            embedded_prefix=prefix_emb_aligned,
+            mask=prefix_attn_mask_aligned,
+            positions=prefix_positions,
+            decode=True,
+            mutable=True,
         )
 
-        # prepare decoding -- final logit decodes the first token
+        # The final prefix logit predicts the FIRST decoded action token.
         last_logit = prefix_logits[:, -1:]
-        output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps))
+        target_token = jnp.argmax(last_logit, axis=-1)
 
-        def step(carry):
-            rng, last_logit, output_tokens, cache, _, step = carry
-
-            # Sample token from last logit
-            # Split RNG for this step
-            rng, rng_step = jax.random.split(rng)
-            token = jax.lax.cond(
-                temperature > 0.0,
-                lambda _: jax.random.categorical(rng_step, last_logit / temperature, axis=-1),
-                lambda _: jnp.argmax(last_logit, axis=-1),
-                operand=None,
-            )
-            output_tokens = put_along_last_axis(output_tokens, jnp.broadcast_to(step, (token.shape[0], 1)), token)
-
-            # Check for early stopping --> stop if all batch elements have EOS token
-            has_eos = jnp.any(token == PALIGEMMA_EOS_TOKEN, axis=-1)
-            all_eos = jnp.all(has_eos)
-
-            # Decode one step
-            token_embedding = self.PaliGemma.llm(token, embed_only=True)
-            positions = prefill_len[:, None] + step + 1
-            mask = jnp.logical_and(
-                jnp.arange(prefill_size + max_decoding_steps)[None, None, :] >= prefix_start[:, None, None],
-                jnp.arange(prefill_size + max_decoding_steps)[None, None, :]
-                < (jnp.broadcast_to(prefill_size + step + 1, (prefix_start.shape[0], 1, 1))),
-            )
-            last_logit, kv_cache, _ = self.PaliGemma.llm(
-                embedded_prefix=token_embedding, mask=mask, positions=positions, decode=True, kv_cache=cache
-            )
-
-            return rng, last_logit, output_tokens, kv_cache, all_eos, step + 1
-
-        def cond(carry):
-            _, _, _, _, all_eos, step = carry
-            return (~all_eos) & (step < max_decoding_steps)
-
-        # Use lax.while_loop so we can jit the full decoding loop.
-        _, _, output_tokens, _, _, _ = jax.lax.while_loop(
-            cond, step, (rng, last_logit, output_tokens, kv_cache, False, 0)
+        prefix_final_hidden_state, _, _ = self.PaliGemma.llm(
+            embedded_prefix=prefix_emb_aligned,
+            mask=prefix_attn_mask_aligned[:, :, :prefill_size],
+            positions=prefix_positions,
+            return_prelogits=True,
         )
-        return output_tokens
+
+        def score_fn(
+            prefix_emb_unaligned_inner,
+            target_token_inner,
+        ):
+            attn_unaligned = make_attn_mask(
+                prefix_mask_unaligned,
+                prefix_ar_mask_unaligned,
+            )
+
+            emb_aligned, mask_aligned, attn_aligned = left_to_right_align(
+                prefix_emb_unaligned_inner,
+                prefix_mask_unaligned,
+                attn_unaligned,
+            )
+
+            attn_aligned = jnp.pad(
+                attn_aligned,
+                ((0, 0), (0, 0), (0, max_decoding_steps)),
+            )
+
+            positions = jnp.cumsum(mask_aligned, axis=-1) - 1
+
+            logits, _, _ = self.PaliGemma.llm(
+                embedded_prefix=emb_aligned,
+                mask=attn_aligned,
+                positions=positions,
+                decode=True,
+            )
+
+            first_step_logits = logits[:, -1:]
+
+            token_ids = (
+                target_token_inner
+                if target_token_inner.ndim == 2
+                else target_token_inner[:, None]
+            )
+
+            chosen = jnp.take_along_axis(
+                first_step_logits,
+                token_ids[..., None],
+                axis=-1,
+            )
+
+            return jnp.sum(chosen)
+
+        def run_decoding(prefix_emb_unaligned_for_run):
+            attn_unaligned = make_attn_mask(
+                prefix_mask_unaligned,
+                prefix_ar_mask_unaligned,
+            )
+
+            (
+                emb_aligned,
+                mask_aligned,
+                attn_aligned,
+            ) = left_to_right_align(
+                prefix_emb_unaligned_for_run,
+                prefix_mask_unaligned,
+                attn_unaligned,
+            )
+
+            local_prefill_size = emb_aligned.shape[1]
+            local_prefill_len = jnp.sum(mask_aligned, axis=-1)
+            local_prefix_start = local_prefill_size - local_prefill_len
+
+            attn_decode = jnp.pad(
+                attn_aligned,
+                ((0, 0), (0, 0), (0, max_decoding_steps)),
+            )
+
+            local_positions = jnp.cumsum(mask_aligned, axis=-1) - 1
+
+            logits, cache, _ = self.PaliGemma.llm(
+                embedded_prefix=emb_aligned,
+                mask=attn_decode,
+                positions=local_positions,
+                decode=True,
+            )
+
+            last_logit_local = logits[:, -1:]
+
+            rng_local, rng_step0 = jax.random.split(rng)
+
+            if temperature > 0.0:
+                token_0 = jax.random.categorical(
+                    rng_step0,
+                    last_logit_local / temperature,
+                    axis=-1,
+                )
+            else:
+                token_0 = jnp.argmax(
+                    last_logit_local,
+                    axis=-1,
+                )
+
+            output_tokens_local = jnp.zeros(
+                (last_logit_local.shape[0], max_decoding_steps)
+            )
+
+            output_tokens_local = put_along_last_axis(
+                output_tokens_local,
+                jnp.broadcast_to(
+                    0,
+                    (token_0.shape[0], 1),
+                ),
+                token_0,
+            )
+
+            has_eos_0 = jnp.any(
+                token_0 == PALIGEMMA_EOS_TOKEN,
+                axis=-1,
+            )
+            all_eos_0 = jnp.all(has_eos_0)
+
+            token_emb_0 = self.PaliGemma.llm(
+                token_0,
+                embed_only=True,
+            )
+
+            positions_0 = local_prefill_len[:, None] + 1
+
+            mask_0 = jnp.logical_and(
+                jnp.arange(local_prefill_size + max_decoding_steps)[
+                    None,
+                    None,
+                    :
+                ]
+                >= local_prefix_start[:, None, None],
+                jnp.arange(local_prefill_size + max_decoding_steps)[
+                    None,
+                    None,
+                    :
+                ]
+                < jnp.broadcast_to(
+                    local_prefill_size + 1,
+                    (local_prefix_start.shape[0], 1, 1),
+                ),
+            )
+
+            last_logit_1, kv_cache_1, out_step0 = self.PaliGemma.llm(
+                embedded_prefix=token_emb_0,
+                mask=mask_0,
+                positions=positions_0,
+                decode=True,
+                kv_cache=cache,
+            )
+
+            def step(carry):
+                rng_step_carry, last_logit_carry, output_tokens_carry, cache_carry, _, step_idx = carry
+
+                rng_step_carry, rng_step = jax.random.split(
+                    rng_step_carry
+                )
+
+                token = jax.lax.cond(
+                    temperature > 0.0,
+                    lambda _: jax.random.categorical(
+                        rng_step,
+                        last_logit_carry / temperature,
+                        axis=-1,
+                    ),
+                    lambda _: jnp.argmax(
+                        last_logit_carry,
+                        axis=-1,
+                    ),
+                    operand=None,
+                )
+
+                output_tokens_carry = put_along_last_axis(
+                    output_tokens_carry,
+                    jnp.broadcast_to(
+                        step_idx,
+                        (token.shape[0], 1),
+                    ),
+                    token,
+                )
+
+                has_eos = jnp.any(
+                    token == PALIGEMMA_EOS_TOKEN,
+                    axis=-1,
+                )
+
+                all_eos = jnp.all(has_eos)
+
+                token_embedding = self.PaliGemma.llm(
+                    token,
+                    embed_only=True,
+                )
+
+                positions = local_prefill_len[:, None] + step_idx + 1
+
+                mask = jnp.logical_and(
+                    jnp.arange(local_prefill_size + max_decoding_steps)[
+                        None,
+                        None,
+                        :
+                    ]
+                    >= local_prefix_start[:, None, None],
+                    jnp.arange(local_prefill_size + max_decoding_steps)[
+                        None,
+                        None,
+                        :
+                    ]
+                    < jnp.broadcast_to(
+                        local_prefill_size + step_idx + 1,
+                        (local_prefix_start.shape[0], 1, 1),
+                    ),
+                )
+
+                next_logit, next_cache, _ = self.PaliGemma.llm(
+                    embedded_prefix=token_embedding,
+                    mask=mask,
+                    positions=positions,
+                    decode=True,
+                    kv_cache=cache_carry,
+                )
+
+                return (
+                    rng_step_carry,
+                    next_logit,
+                    output_tokens_carry,
+                    next_cache,
+                    all_eos,
+                    step_idx + 1,
+                )
+
+            def cond(carry):
+                _, _, _, _, all_eos, step_idx = carry
+                return (~all_eos) & (
+                    step_idx < max_decoding_steps
+                )
+
+            _, _, output_tokens_local, _, _, _ = jax.lax.while_loop(
+                cond,
+                step,
+                (
+                    rng_local,
+                    last_logit_1,
+                    output_tokens_local,
+                    kv_cache_1,
+                    all_eos_0,
+                    1,
+                ),
+            )
+
+            return output_tokens_local, out_step0
+
+        output_tokens, first_decode_output = run_decoding(
+            prefix_emb_unaligned
+        )
+
+        hook_data = collect_hook_data(
+            model=self,
+            rng=rng,
+            observation=observation,
+
+            prefix_embeddings=prefix_emb_unaligned,
+            prefix_mask=prefix_mask_unaligned,
+            prefix_ar_mask=prefix_ar_mask_unaligned,
+
+            prefix_embeddings_aligned=prefix_emb_aligned,
+            prefix_mask_aligned=prefix_mask_aligned,
+            prefix_attn_mask_aligned=prefix_attn_mask_aligned,
+
+            prefix_final_hidden_state=prefix_final_hidden_state,
+
+            kv_cache=kv_cache,
+
+            first_step_logits=last_logit,
+            target_token=target_token,
+
+            spans=spans,
+            meta=meta,
+
+            actions=output_tokens,
+
+            run_decoding=run_decoding,
+            score_first_token=score_fn,
+
+            first_decode_output=first_decode_output,
+
+            max_decoding_steps=max_decoding_steps,
+        )
+
+        return output_tokens, hook_data

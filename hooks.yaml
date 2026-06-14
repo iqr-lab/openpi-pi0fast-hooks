@@ -1,0 +1,21 @@
+record:
+  enabled: true
+  dir: /nfs/roberts/scratch/pi_tkf6/as4643/policy_records
+  add_timestamp: true
+
+hooks:
+  enabled:
+    - observation_input
+    - token_spans
+    - prefix_embeddings
+    - prefix_final_hidden_state
+    - prefix_gradients
+    - action_chunks
+    - raw_attention_weights
+
+  action_chunks:
+    num_chunks: 1
+
+  raw_attention_weights:
+    layers: [1, 16]
+  

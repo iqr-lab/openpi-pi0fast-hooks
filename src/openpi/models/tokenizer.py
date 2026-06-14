@@ -19,10 +19,62 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def tokenize(self, prompt: str) -> tuple[np.ndarray, np.ndarray]:
+    def tokenize(
+        self, prompt: str, state: np.ndarray | None = None
+    ) -> tuple:
+        """Tokenize a prompt (and optional discretized state) into token IDs and a validity mask.
+
+        Returns (π0 format, state=None):
+            tokens, mask, None, None
+
+        Returns (π0.5 format, state provided):
+            tokens, mask, task_token_len, state_token_len,
+            task_piece_id, task_piece_begin, task_piece_end,
+            state_piece_id, state_piece_begin, state_piece_end
+
+        The piece_begin/end arrays give character offsets within the segment strings
+        "Task: {text}, " and "State: {bins};\n" for visualization filtering.
+        """
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
-        # tokenize "\n" separately as the "start of answer" token
-        tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
+        task_token_len: int | None = None
+        state_token_len: int | None = None
+
+        if state is not None:
+            # π0.5 format: proprioceptive state discretized into 256 bins and appended as text tokens.
+            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            tokens = self._tokenizer.encode(full_prompt, add_bos=True)
+
+            # Compute task/state token boundary for per-modality attribution.
+            # In SentencePiece, trailing spaces merge into the next token's ▁ prefix, so
+            # "Task: ..., State: " tokenizes to the same prefix as the full string's first N tokens.
+            task_prefix_ids = self._tokenizer.encode(f"Task: {cleaned_text}, State: ", add_bos=True)
+            task_token_len = len(task_prefix_ids)
+            suffix_ids = self._tokenizer.encode(";\nAction: ")
+            # Clamp to the effective sequence length (before padding/truncation).
+            effective_len = min(len(tokens), self._max_len)
+            state_token_len = max(0, min(len(tokens) - task_token_len - len(suffix_ids),
+                                         effective_len - task_token_len))
+
+            # Piece spans for visualization: tokenize task and state segments separately
+            # so the visualization layer can filter "Task: " / ", " and "State: " / ";\n".
+            # BOS has no character position — represent it with zero-width span (0, 0).
+            task_seg   = f"Task: {cleaned_text}, "
+            task_proto = self._tokenizer.encode(task_seg, out_type="immutable_proto")
+            task_piece_id    = np.asarray([self._tokenizer.bos_id()] + [p.id    for p in task_proto.pieces], dtype=np.int32)
+            task_piece_begin = np.asarray([0]                         + [p.begin for p in task_proto.pieces], dtype=np.int32)
+            task_piece_end   = np.asarray([0]                         + [p.end   for p in task_proto.pieces], dtype=np.int32)
+
+            state_seg   = f"State: {state_str};\n"
+            state_proto = self._tokenizer.encode(state_seg, out_type="immutable_proto")
+            state_piece_id    = np.asarray([p.id    for p in state_proto.pieces], dtype=np.int32)
+            state_piece_begin = np.asarray([p.begin for p in state_proto.pieces], dtype=np.int32)
+            state_piece_end   = np.asarray([p.end   for p in state_proto.pieces], dtype=np.int32)
+        else:
+            # π0 format: state is a continuous suffix token, not embedded in the prompt.
+            tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
+
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
             padding = [False] * (self._max_len - tokens_len)
@@ -37,7 +89,11 @@ class PaligemmaTokenizer:
             tokens = tokens[: self._max_len]
             mask = [True] * self._max_len
 
-        return np.asarray(tokens), np.asarray(mask)
+        if state is not None:
+            return (np.asarray(tokens), np.asarray(mask), task_token_len, state_token_len,
+                    task_piece_id, task_piece_begin, task_piece_end,
+                    state_piece_id, state_piece_begin, state_piece_end)
+        return np.asarray(tokens), np.asarray(mask), task_token_len, state_token_len
 
 
 class FASTTokenizer:
@@ -246,7 +302,7 @@ class FSQTokenizer:
         assert fsq_tokenizer_path is not None, "fsq_tokenizer_path must be provided"
         # Download tokenizer
         path = download.maybe_download(fsq_tokenizer_path)
-        tok_path = os.path.join(path, os.listdir(path)[0])  # noqa: PTH118
+        tok_path = os.path.join(path, os.listdir(path)[0])
 
         # Split step from path
         step = int(tok_path.split("/")[-1])
