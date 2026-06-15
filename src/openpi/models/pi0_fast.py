@@ -711,7 +711,7 @@ class Pi0FAST(_model.BaseModel):
             actions=output_tokens,
 
             run_decoding=run_decoding,
-            score_first_token=score_fn,
+            score_fn=score_fn,
 
             first_decode_output=first_decode_output,
 

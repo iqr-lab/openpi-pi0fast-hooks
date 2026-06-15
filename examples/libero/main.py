@@ -3,7 +3,7 @@ import dataclasses
 import logging
 import math
 import pathlib
-
+from typing import Optional
 import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
