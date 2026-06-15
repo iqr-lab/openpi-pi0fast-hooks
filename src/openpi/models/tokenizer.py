@@ -55,23 +55,53 @@ class FASTTokenizer:
 
     def tokenize(
         self, prompt: str, state: np.ndarray, actions: np.ndarray | None
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[
+        np.ndarray,  # tokens
+        np.ndarray,  # token_mask
+        np.ndarray,  # ar_mask
+        np.ndarray,  # loss_mask
+        np.int32,    # task_len
+        np.int32,    # state_len
+        np.ndarray,  # task_piece_id
+        np.ndarray,  # task_piece_begin
+        np.ndarray,  # task_piece_end
+        np.ndarray,  # state_piece_id
+        np.ndarray,  # state_piece_begin
+        np.ndarray,  # state_piece_end
+    ]:
         cleaned_text = prompt.lower().strip().replace("_", " ")
 
         # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
         discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-
-        # Convention: prefix includes prompt and string-representation of state, followed by ';'
         state_str = " ".join(map(str, discretized_state))
-        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
-        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
 
+        # TASK
+        task_segment = f"Task: {cleaned_text}, "
+        task_proto = self._paligemma_tokenizer.encode(task_segment, out_type="immutable_proto")
+
+        task_piece_id = [int(self._paligemma_tokenizer.bos_id())] + [int(p.id) for p in task_proto.pieces]
+        task_piece_begin = [0] + [int(p.begin) for p in task_proto.pieces]
+        task_piece_end = [0] + [int(p.end) for p in task_proto.pieces]
+
+        task_tokens = task_piece_id
+
+        # STATE
+        state_segment = f"State: {state_str};\n"
+        state_proto = self._paligemma_tokenizer.encode(state_segment, out_type="immutable_proto")
+
+        state_piece_id = [int(p.id) for p in state_proto.pieces]
+        state_piece_begin = [int(p.begin) for p in state_proto.pieces]
+        state_piece_end = [int(p.end) for p in state_proto.pieces]
+
+        state_tokens = state_piece_id
+
+        # Prefix = task + state
+        prefix_tokens = task_tokens + state_tokens
+
+        # Optional postfix = action supervision tokens
         if actions is not None:
-            # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
             action_tokens = self._fast_tokenizer(actions[None])[0]
             action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
-
-            # Convention: postfix contains 'Action:' followed by FAST tokens, followed by '|'
             postfix_tokens = (
                 self._paligemma_tokenizer.encode("Action: ")
                 + action_tokens_in_pg.tolist()
@@ -80,14 +110,13 @@ class FASTTokenizer:
         else:
             postfix_tokens = []
 
-        # Create output token sequence & masks
-        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
+        # Full sequence
         tokens = prefix_tokens + postfix_tokens
         token_mask = [True] * len(tokens)
         ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
-        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)
 
-        # Pad tokens to max length
+        # Pad/truncate model sequence
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
             padding = [False] * (self._max_len - tokens_len)
@@ -106,7 +135,47 @@ class FASTTokenizer:
             ar_mask = ar_mask[: self._max_len]
             loss_mask = loss_mask[: self._max_len]
 
-        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+        # Effective lengths after truncation
+        effective_task_len = min(len(task_tokens), self._max_len)
+        remaining_space = max(0, self._max_len - effective_task_len)
+        effective_state_len = min(len(state_tokens), remaining_space)
+
+        # Slice piece_id/begin/end to effective lengths
+        task_piece_id = task_piece_id[:effective_task_len]
+        task_piece_begin = task_piece_begin[:effective_task_len]
+        task_piece_end = task_piece_end[:effective_task_len]
+
+        state_piece_id = state_piece_id[:effective_state_len]
+        state_piece_begin = state_piece_begin[:effective_state_len]
+        state_piece_end = state_piece_end[:effective_state_len]
+
+        # Pad arrays
+        if effective_task_len < self._max_len:
+            pad_n = self._max_len - effective_task_len
+            task_piece_id = task_piece_id + [0] * pad_n
+            task_piece_begin = task_piece_begin + [0] * pad_n
+            task_piece_end = task_piece_end + [0] * pad_n
+
+        if effective_state_len < self._max_len:
+            pad_n = self._max_len - effective_state_len
+            state_piece_id = state_piece_id + [0] * pad_n
+            state_piece_begin = state_piece_begin + [0] * pad_n
+            state_piece_end = state_piece_end + [0] * pad_n
+
+        return (
+            np.asarray(tokens, dtype=np.int32),
+            np.asarray(token_mask, dtype=bool),
+            np.asarray(ar_mask, dtype=np.int32),
+            np.asarray(loss_mask, dtype=bool),
+            np.int32(effective_task_len),
+            np.int32(effective_state_len),
+            np.asarray(task_piece_id, dtype=np.int32),
+            np.asarray(task_piece_begin, dtype=np.int32),
+            np.asarray(task_piece_end, dtype=np.int32),
+            np.asarray(state_piece_id, dtype=np.int32),
+            np.asarray(state_piece_begin, dtype=np.int32),
+            np.asarray(state_piece_end, dtype=np.int32),
+        )
 
     def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
         # Decode predicted output tokens
@@ -175,6 +244,7 @@ class BinningTokenizer:
         discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
         # Convention: prefix includes prompt and string-representation of state, followed by ';'
+
         state_str = " ".join(map(str, discretized_state))
         prefix = f"Task: {cleaned_text}, State: {state_str};\n"
         prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
@@ -246,7 +316,7 @@ class FSQTokenizer:
         assert fsq_tokenizer_path is not None, "fsq_tokenizer_path must be provided"
         # Download tokenizer
         path = download.maybe_download(fsq_tokenizer_path)
-        tok_path = os.path.join(path, os.listdir(path)[0])
+        tok_path = os.path.join(path, os.listdir(path)[0])  # noqa: PTH118
 
         # Split step from path
         step = int(tok_path.split("/")[-1])
