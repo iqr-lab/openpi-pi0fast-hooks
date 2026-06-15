@@ -91,42 +91,105 @@ class Observation(Generic[ArrayT]):
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
+
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
-    # pi0-fast model specific fields.
-
-    # Token auto-regressive mask (for FAST autoregressive model).
-    token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
-    # Token loss mask (for FAST autoregressive model).
-    token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
-
-    # pi0.5 debug recording fields (optional).
-    # When the tokenized_prompt contains concatenated task+state tokens (discrete_state_input=True),
-    # these lengths allow splitting them for per-modality attribution.
-    # pytree_node=False keeps them as plain Python ints (static) so JAX jit doesn't trace them.
+    # Python scalar, not a pytree leaf.
     task_token_len: int | None = struct.field(pytree_node=False, default=None)
     state_token_len: int | None = struct.field(pytree_node=False, default=None)
 
+    # Task pieces
+    task_piece_id: at.Int[ArrayT, "t"] | None = None
+    task_piece_begin: at.Int[ArrayT, "t"] | None = None
+    task_piece_end: at.Int[ArrayT, "t"] | None = None
+
+    # State pieces
+    state_piece_id: at.Int[ArrayT, "t"] | None = None
+    state_piece_begin: at.Int[ArrayT, "t"] | None = None
+    state_piece_end: at.Int[ArrayT, "t"] | None = None
+
+    # pi0-fast model specific fields.
+    token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
+    token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
-        """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
-        # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
+        """Map nested dict data into the structured Observation format."""
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
-        # task_token_len, state_token_len, and piece arrays are static metadata
-        # (pytree_node=False). Policy.infer batches all dict values via jax.tree.map
-        # → JAX arrays with a leading batch dim; convert back to plain Python/numpy.
-        def _to_python_int(val) -> int | None:
-            if val is None:
-                return None
-            return int(np.asarray(val).ravel()[0])
+
+        task_token_len = data.get("task_token_len")
+        task_piece_id = data.get("task_piece_id")
+        task_piece_begin = data.get("task_piece_begin")
+        task_piece_end = data.get("task_piece_end")
+
+        state_token_len = data.get("state_token_len")
+        state_piece_id = data.get("state_piece_id")
+        state_piece_begin = data.get("state_piece_begin")
+        state_piece_end = data.get("state_piece_end")
+
+        # Convert task_token_len into a true Python scalar.
+        if task_token_len is not None:
+            arr = np.asarray(task_token_len)
+            if arr.ndim == 0:
+                task_token_len = int(arr.item())
+            elif arr.ndim == 1 and arr.shape[0] == 1:
+                task_token_len = int(arr[0].item())
+            else:
+                raise ValueError(
+                    f"task_token_len must be scalar or shape (1,), got shape {arr.shape}"
+                )
+
+        # Convert state_token_len into a true Python scalar.
+        if state_token_len is not None:
+            arr = np.asarray(state_token_len)
+            if arr.ndim == 0:
+                state_token_len = int(arr.item())
+            elif arr.ndim == 1 and arr.shape[0] == 1:
+                state_token_len = int(arr[0].item())
+            else:
+                raise ValueError(
+                    f"state_token_len must be scalar or shape (1,), got shape {arr.shape}"
+                )
+
+        # Squeeze batch dim for task piece arrays if present as (1, T).
+        if task_piece_id is not None:
+            task_piece_id = jnp.asarray(task_piece_id)
+            if task_piece_id.ndim == 2 and task_piece_id.shape[0] == 1:
+                task_piece_id = task_piece_id[0]
+
+        if task_piece_begin is not None:
+            task_piece_begin = jnp.asarray(task_piece_begin)
+            if task_piece_begin.ndim == 2 and task_piece_begin.shape[0] == 1:
+                task_piece_begin = task_piece_begin[0]
+
+        if task_piece_end is not None:
+            task_piece_end = jnp.asarray(task_piece_end)
+            if task_piece_end.ndim == 2 and task_piece_end.shape[0] == 1:
+                task_piece_end = task_piece_end[0]
+
+        # Squeeze batch dim for state piece arrays if present as (1, T).
+        if state_piece_id is not None:
+            state_piece_id = jnp.asarray(state_piece_id)
+            if state_piece_id.ndim == 2 and state_piece_id.shape[0] == 1:
+                state_piece_id = state_piece_id[0]
+
+        if state_piece_begin is not None:
+            state_piece_begin = jnp.asarray(state_piece_begin)
+            if state_piece_begin.ndim == 2 and state_piece_begin.shape[0] == 1:
+                state_piece_begin = state_piece_begin[0]
+
+        if state_piece_end is not None:
+            state_piece_end = jnp.asarray(state_piece_end)
+            if state_piece_end.ndim == 2 and state_piece_end.shape[0] == 1:
+                state_piece_end = state_piece_end[0]
+
 
         return cls(
             images=data["image"],
@@ -134,10 +197,16 @@ class Observation(Generic[ArrayT]):
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            task_token_len=task_token_len,
+            state_token_len=state_token_len,
+            task_piece_id=task_piece_id,
+            task_piece_begin=task_piece_begin,
+            task_piece_end=task_piece_end,
+            state_piece_id=state_piece_id,
+            state_piece_begin=state_piece_begin,
+            state_piece_end=state_piece_end,
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
-            task_token_len=_to_python_int(data.get("task_token_len")),
-            state_token_len=_to_python_int(data.get("state_token_len")),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

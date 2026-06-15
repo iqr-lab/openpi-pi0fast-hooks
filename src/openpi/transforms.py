@@ -247,31 +247,16 @@ class AbsoluteActions(DataTransformFn):
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
-    discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
             raise ValueError("Prompt is required")
 
-        if self.discrete_state_input:
-            if (state := data.get("state", None)) is None:
-                raise ValueError("State is required.")
-        else:
-            state = None
-
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tok_out = self.tokenizer.tokenize(prompt, state)
-        tokens, token_masks, task_token_len, state_token_len = tok_out[:4]
-        result = {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
-        if task_token_len is not None:
-            result["task_token_len"] = task_token_len
-            result["state_token_len"] = state_token_len
-        if len(tok_out) > 4:
-            (result["task_piece_id"],    result["task_piece_begin"],  result["task_piece_end"],
-             result["state_piece_id"],   result["state_piece_begin"], result["state_piece_end"]) = tok_out[4:]
-        return result
+        tokens, token_masks = self.tokenizer.tokenize(prompt)
+        return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -286,13 +271,37 @@ class TokenizeFASTInputs(DataTransformFn):
             prompt = prompt.item()
 
         state, actions = data["state"], data.get("actions")
-        tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize(prompt, state, actions)
+        (
+            tokens,
+            token_mask,
+            ar_mask,
+            loss_mask,
+            task_len,
+            state_len,
+            task_piece_id,
+            task_piece_begin,
+            task_piece_end,
+            state_piece_id,
+            state_piece_begin,
+            state_piece_end,
+        ) = self.tokenizer.tokenize(prompt, state, actions)
+
+        # print(f"State token len: {state_len}, task token len: {task_len}")
+
         return {
             **data,
             "tokenized_prompt": tokens,
             "tokenized_prompt_mask": token_mask,
             "token_ar_mask": ar_mask,
             "token_loss_mask": loss_mask,
+            "task_token_len": int(task_len),         # scalar
+            "state_token_len": int(state_len),       # scalar
+            "task_piece_id": np.asarray(task_piece_id, dtype=np.int32),       # (t,)
+            "task_piece_begin": np.asarray(task_piece_begin, dtype=np.int32), # (t,)
+            "task_piece_end": np.asarray(task_piece_end, dtype=np.int32),     # (t,)
+            "state_piece_id": np.asarray(state_piece_id, dtype=np.int32),     # (s,)
+            "state_piece_begin": np.asarray(state_piece_begin, dtype=np.int32), # (s,)
+            "state_piece_end": np.asarray(state_piece_end, dtype=np.int32),   # (s,)
         }
 
 
