@@ -65,6 +65,7 @@ def collect_hook_data(
 
     if is_hook_enabled("token_spans"):
         data["token_spans"] = compute_token_spans(
+            prefix_embeddings=prefix_embeddings
             spans=spans,
             meta=meta,
         )
@@ -86,6 +87,7 @@ def collect_hook_data(
     if is_hook_enabled("raw_attention_weights"):
         data["raw_attention_weights"] = compute_raw_attention_weights(
             first_decode_output=first_decode_output,
+            prefix_len=prefix_embeddings.shape[1],
         )
 
     return data
