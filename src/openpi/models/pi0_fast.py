@@ -498,11 +498,7 @@ class Pi0FAST(_model.BaseModel):
                 prefix_ar_mask_unaligned,
             )
 
-            (
-                emb_aligned,
-                mask_aligned,
-                attn_aligned,
-            ) = left_to_right_align(
+            emb_aligned, mask_aligned, attn_aligned = left_to_right_align(
                 prefix_emb_unaligned_for_run,
                 prefix_mask_unaligned,
                 attn_unaligned,

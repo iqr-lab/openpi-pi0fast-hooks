@@ -33,7 +33,7 @@ def collect_hook_data(
     actions,
 
     run_decoding,
-    score_first_token,
+    score_fn,
 
     first_decode_output,
 
@@ -80,7 +80,7 @@ def collect_hook_data(
         data["prefix_gradients"] = compute_prefix_gradients(
             prefix_embeddings=prefix_embeddings,
             target_token=target_token,
-            score_first_token=score_first_token,
+            score_fn=score_fn,
         )
 
     if is_hook_enabled("raw_attention_weights"):
