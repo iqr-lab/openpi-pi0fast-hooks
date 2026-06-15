@@ -124,15 +124,6 @@ class Pi0FASTConfig(_model.BaseModelConfig):
                 task_token_len=jax.ShapeDtypeStruct([], jnp.int32),
                 state_token_len=jax.ShapeDtypeStruct([], jnp.int32),
 
-                task_piece_id=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
-                task_piece_begin=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
-                task_piece_end=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
-
-                
-                state_piece_id=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
-                state_piece_begin=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
-                state_piece_end=jax.ShapeDtypeStruct([self.max_token_len], jnp.int32),
-
                 token_ar_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 token_loss_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.bool_),
             )

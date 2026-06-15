@@ -2,7 +2,7 @@
 #SBATCH --job-name=pi0fast-hooks-libero
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
-#SBATCH --partition=pi_co54
+#SBATCH --partition=scavenge_gpu
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=256G
