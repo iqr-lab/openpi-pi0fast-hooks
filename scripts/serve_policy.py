@@ -15,8 +15,8 @@ from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
 from openpi.training import config as _config
 
-from pi05_hooks.hook_runner import set_enabled_hooks, set_hook_config
-import pi05_hooks.hooks  # noqa: F401
+from pi0fast_hooks.hook_runner import set_enabled_hooks, set_hook_config
+import pi0fast_hooks.hooks  # noqa: F401
 
 
 class EnvMode(enum.Enum):

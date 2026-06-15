@@ -17,7 +17,7 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
-from pi05_hooks.hook_runner import emit_all
+from pi0fast_hooks.hook_runner import emit_all
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 

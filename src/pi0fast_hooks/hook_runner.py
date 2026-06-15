@@ -24,8 +24,20 @@ def get_hook_config() -> dict[str, Any]:
     return _HOOK_CONFIG
 
 
-def register_hook(name: str, fn: Callable[[dict[str, Any]], Any]) -> None:
+def register_hook(
+    name: str,
+    fn: Callable[[dict[str, Any]], Any] | None = None,
+):
+    # decorator usage
+    if fn is None:
+        def decorator(func):
+            _HOOKS[name] = func
+            return func
+        return decorator
+
+    # direct registration usage
     _HOOKS[name] = fn
+    return fn
 
 
 def emit_all(data: dict[str, Any]) -> list[dict[str, Any]]:
