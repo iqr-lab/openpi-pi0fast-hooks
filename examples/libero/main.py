@@ -44,6 +44,8 @@ class Args:
 
     seed: int = 7  # Random Seed (for reproducibility)
 
+    record_dir: Optional[str] = None
+
 
 def eval_libero(args: Args) -> None:
     # Set random seed
