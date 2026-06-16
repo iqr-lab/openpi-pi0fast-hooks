@@ -65,7 +65,7 @@ def collect_hook_data(
 
     if is_hook_enabled("token_spans"):
         data["token_spans"] = compute_token_spans(
-            prefix_embeddings=prefix_embeddings
+            prefix_embeddings=prefix_embeddings,
             spans=spans,
             meta=meta,
         )

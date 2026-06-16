@@ -217,11 +217,29 @@ class Attention(nn.Module):
         big_neg = -2.3819763e38  # See gemma/modules.py
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
+        # probs has shape [B, K, G, T, S]
+        # B = batch
+        # K = num_kv_heads
+        # G = groups per kv head (so total heads = K * G)
+        # T = query length
+        # S = key length
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
 
+        # Weighted sum over values -> standard attention output
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
-        return self.attn_vec_einsum("BTNH,NHD->BTD", encoded), kv_cache
+
+        attn_output = self.attn_vec_einsum("BTNH,NHD->BTD", encoded)
+
+        # Reformat attention to [B, H, T, S] so the head axis is explicit.
+        probs_full = einops.rearrange(probs, "B K G T S -> B (K G) T S")
+
+        # Always collect the LAST query row.
+        # In the prefix prefill call, this row is the one whose logit predicts
+        # the first decoded action token.
+        attn_last_row = probs_full[:, :, -1, :]    # [B, H, S]
+
+        return attn_output, kv_cache, attn_last_row
 
 
 @at.typecheck
@@ -259,17 +277,30 @@ class Block(nn.Module):
             self.drop = lambda x, _: x
 
     def __call__(self, x, kv_cache, positions, attn_mask, decode, deterministic=True):  # noqa: FBT002
+        # x: [B, T, D] hidden states for this transformer layer
         x = nn.with_logical_constraint(x, ("act_batch", "act_len", "act_emb"))
+
+        # Standard pre-attention normalization
         inputs_normalized = self.pre_attention_norm(x)
-        attn_output, kv_cache = self.attn(inputs_normalized, positions, attn_mask, kv_cache, decode, deterministic)
+
+        attn_output, kv_cache, attn_last_row = self.attn(
+            inputs_normalized, positions, attn_mask, kv_cache, decode, deterministic
+        )
+
+        # Residual block as before
         attn_output = self.drop(attn_output, deterministic)
         attn_output += x
         residual = attn_output
+
+        # Feed-forward block as before
         attn_output = self.pre_ffw_norm(attn_output)
         outputs = self.mlp(attn_output)
         outputs = self.drop(outputs, deterministic)
         outputs = residual + outputs
-        return outputs, kv_cache
+
+        # Scan stacks (kv_cache, attn_last_row) across all depth layers.
+        # attn_last_row: [B, H, S] — softmax weights at last query pos
+        return outputs, (kv_cache, attn_last_row)
 
 
 KVCache: TypeAlias = tuple[at.Int[at.Array, " b"], at.Float[at.Array, "b _t _k _h"], at.Float[at.Array, "b _t _v _h"]]
@@ -395,17 +426,25 @@ class Module(nn.Module):
         blocks = [
             nn.scan(
                 block_cls,
+                # We scan params over depth (one parameter set per layer).
+                # attn_last_row is returned directly from Block and stacked by the scan.
                 variable_axes={"params": 0},
                 split_rngs={"params": True, "dropout": True},
                 in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),  # 0=kv_cache, 1=positions, 2=mask
                 length=self.depth,
             )(parent=layers, **block_kw)
         ]
+
         for block in blocks:
-            x, kv_cache = block(x, kv_cache, positions, mask, decode, deterministic)
+            # Scan stacks (kv_cache, attn_rows) across all depth layers.
+            # kv_cache[2] after scan: [depth, B, S_cache, num_kv_heads, head_dim]
+            # attn_rows after scan:   [depth, B, H, S]
+            x, (kv_cache, attn_rows) = block(x, kv_cache, positions, mask, decode, deterministic)
 
         assert x.dtype == jnp.dtype(self.embed_dtype)  # Sanity check.
         out["encoded"] = x
+        out["attn_rows"] = attn_rows   # [depth, B, H, S]
+        out["v_cache"] = kv_cache[2]   # [depth, B, S_cache, num_kv_heads, head_dim]
 
         x = RMSNorm(name="final_norm")(x)
         out["pre_logits"] = x
