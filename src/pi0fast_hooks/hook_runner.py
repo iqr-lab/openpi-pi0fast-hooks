@@ -1,6 +1,7 @@
-from collections.abc import Callable
 import logging
+from collections.abc import Callable
 from typing import Any
+
 
 logger = logging.getLogger("openpi.hooks")
 
@@ -45,8 +46,16 @@ def register_hook(
 
 def emit_all(data: dict[str, Any]) -> list[dict[str, Any]]:
     records = []
+    enabled_hooks = sorted(_ENABLED_HOOKS)
 
-    for name in sorted(_ENABLED_HOOKS):
+    if enabled_hooks:
+        logger.info(
+            "Capturing %d hooks: %s",
+            len(enabled_hooks),
+            ", ".join(enabled_hooks),
+        )
+
+    for name in enabled_hooks:
         if name not in _HOOKS:
             raise ValueError(f"Unknown hook: {name}")
 
@@ -57,9 +66,14 @@ def emit_all(data: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if isinstance(result, list):
             records.extend(result)
-            logger.info("Captured hook '%s' (%d records)", name, len(result))
+            record_count = len(result)
         else:
             records.append(result)
-            logger.info("Captured hook '%s'", name)
+            record_count = 1
+
+        logger.info("Captured hook '%s' (%d record(s))", name, record_count)
+
+    if enabled_hooks:
+        logger.info("Hook capture complete: %d total record(s)", len(records))
 
     return records
