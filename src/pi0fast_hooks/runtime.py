@@ -4,6 +4,7 @@ from pi0fast_hooks.computations.token_spans import compute_token_spans
 from pi0fast_hooks.computations.action_chunks import compute_action_chunks
 from pi0fast_hooks.computations.prefix_gradients import compute_prefix_gradients
 from pi0fast_hooks.computations.raw_attention import compute_raw_attention_weights
+from pi0fast_hooks.computations.value_vectors import compute_value_vectors
 
 
 def collect_hook_data(
@@ -88,6 +89,12 @@ def collect_hook_data(
         data["raw_attention_weights"] = compute_raw_attention_weights(
             first_decode_output=first_decode_output,
             prefix_len=prefix_embeddings.shape[1],
+        )
+
+    if is_hook_enabled("value_vectors"):
+        data["value_vectors"] = compute_value_vectors(
+            prefix_embeddings=prefix_embeddings,
+            kv_cache=kv_cache,
         )
 
     return data

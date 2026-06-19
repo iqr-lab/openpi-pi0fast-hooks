@@ -11,10 +11,13 @@ hooks:
     - prefix_final_hidden_state
     - prefix_gradients
     - raw_attention_weights
+    - value_vectors
 
   action_chunks:
     num_chunks: 1
 
   raw_attention_weights:
     layers: [1, 16]
-  
+
+  value_vectors:
+    layers: [1, 16]
