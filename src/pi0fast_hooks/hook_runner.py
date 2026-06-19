@@ -1,5 +1,8 @@
 from collections.abc import Callable
+import logging
 from typing import Any
+
+logger = logging.getLogger("openpi.hooks")
 
 _ENABLED_HOOKS: set[str] = set()
 _HOOKS: dict[str, Callable[[dict[str, Any]], Any]] = {}
@@ -50,10 +53,13 @@ def emit_all(data: dict[str, Any]) -> list[dict[str, Any]]:
         result = _HOOKS[name](data)
 
         if result is None:
+            logger.info("Hook '%s' produced no record", name)
             continue
         if isinstance(result, list):
             records.extend(result)
+            logger.info("Captured hook '%s' (%d records)", name, len(result))
         else:
             records.append(result)
+            logger.info("Captured hook '%s'", name)
 
     return records
