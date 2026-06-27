@@ -6,3 +6,4 @@ from pi0fast_hooks.hooks import action_chunks  # noqa: F401
 from pi0fast_hooks.hooks import raw_attention_weights  # noqa: F401
 from pi0fast_hooks.hooks import token_spans  # noqa: F401
 from pi0fast_hooks.hooks import value_vectors  # noqa: F401
+from pi0fast_hooks.hooks import insight_metrics  # noqa: F401

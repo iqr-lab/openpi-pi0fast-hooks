@@ -14,7 +14,7 @@ def compute_action_chunks(
     for _ in range(num_chunks):
         rng, _ = jax.random.split(rng)
 
-        actions, _ = run_decoding(
+        actions, *_ = run_decoding(
             prefix_embeddings,
         )
 

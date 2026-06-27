@@ -16,6 +16,10 @@ from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
 from pi0fast_hooks.runtime import collect_hook_data
+from pi0fast_hooks.computations.insight_metrics import (
+    make_insight_metrics_record,
+    update_insight_metric_trackers,
+)
 
 logger = logging.getLogger("openpi")
 
@@ -532,6 +536,12 @@ class Pi0FAST(_model.BaseModel):
             output_tokens_local = jnp.zeros(
                 (last_logit_local.shape[0], max_decoding_steps)
             )
+            aleatoric_uncertainty = jnp.zeros_like(output_tokens_local)
+            epistemic_uncertainty = jnp.zeros_like(output_tokens_local)
+            entropy = jnp.zeros_like(output_tokens_local)
+            selected_log_probs = jnp.zeros_like(output_tokens_local)
+            selected_probs = jnp.zeros_like(output_tokens_local)
+            selected_perplexity = jnp.zeros_like(output_tokens_local)
 
             output_tokens_local = put_along_last_axis(
                 output_tokens_local,
@@ -540,6 +550,24 @@ class Pi0FAST(_model.BaseModel):
                     (token_0.shape[0], 1),
                 ),
                 token_0,
+            )
+            (
+                aleatoric_uncertainty,
+                epistemic_uncertainty,
+                entropy,
+                selected_log_probs,
+                selected_probs,
+                selected_perplexity,
+            ) = update_insight_metric_trackers(
+                logits=last_logit_local,
+                token=token_0,
+                step=jnp.asarray(0, dtype=jnp.int32),
+                aleatoric_uncertainty=aleatoric_uncertainty,
+                epistemic_uncertainty=epistemic_uncertainty,
+                entropy=entropy,
+                selected_log_probs=selected_log_probs,
+                selected_probs=selected_probs,
+                selected_perplexity=selected_perplexity,
             )
 
             has_eos_0 = jnp.any(
@@ -582,7 +610,20 @@ class Pi0FAST(_model.BaseModel):
             )
 
             def step(carry):
-                rng_step_carry, last_logit_carry, output_tokens_carry, cache_carry, _, step_idx = carry
+                (
+                    rng_step_carry,
+                    last_logit_carry,
+                    output_tokens_carry,
+                    cache_carry,
+                    _,
+                    step_idx,
+                    au_carry,
+                    eu_carry,
+                    entropy_carry,
+                    selected_log_probs_carry,
+                    selected_probs_carry,
+                    selected_perplexity_carry,
+                ) = carry
 
                 rng_step_carry, rng_step = jax.random.split(
                     rng_step_carry
@@ -609,6 +650,24 @@ class Pi0FAST(_model.BaseModel):
                         (token.shape[0], 1),
                     ),
                     token,
+                )
+                (
+                    au_carry,
+                    eu_carry,
+                    entropy_carry,
+                    selected_log_probs_carry,
+                    selected_probs_carry,
+                    selected_perplexity_carry,
+                ) = update_insight_metric_trackers(
+                    logits=last_logit_carry,
+                    token=token,
+                    step=step_idx,
+                    aleatoric_uncertainty=au_carry,
+                    epistemic_uncertainty=eu_carry,
+                    entropy=entropy_carry,
+                    selected_log_probs=selected_log_probs_carry,
+                    selected_probs=selected_probs_carry,
+                    selected_perplexity=selected_perplexity_carry,
                 )
 
                 has_eos = jnp.any(
@@ -658,15 +717,34 @@ class Pi0FAST(_model.BaseModel):
                     next_cache,
                     all_eos,
                     step_idx + 1,
+                    au_carry,
+                    eu_carry,
+                    entropy_carry,
+                    selected_log_probs_carry,
+                    selected_probs_carry,
+                    selected_perplexity_carry,
                 )
 
             def cond(carry):
-                _, _, _, _, all_eos, step_idx = carry
+                _, _, _, _, all_eos, step_idx, _, _, _, _, _, _ = carry
                 return (~all_eos) & (
                     step_idx < max_decoding_steps
                 )
 
-            _, _, output_tokens_local, _, _, _ = jax.lax.while_loop(
+            (
+                _,
+                _,
+                output_tokens_local,
+                _,
+                _,
+                _,
+                aleatoric_uncertainty,
+                epistemic_uncertainty,
+                entropy,
+                selected_log_probs,
+                selected_probs,
+                selected_perplexity,
+            ) = jax.lax.while_loop(
                 cond,
                 step,
                 (
@@ -676,12 +754,27 @@ class Pi0FAST(_model.BaseModel):
                     kv_cache_1,
                     all_eos_0,
                     1,
+                    aleatoric_uncertainty,
+                    epistemic_uncertainty,
+                    entropy,
+                    selected_log_probs,
+                    selected_probs,
+                    selected_perplexity,
                 ),
             )
 
-            return output_tokens_local, out_step0
+            insight_metrics = make_insight_metrics_record(
+                aleatoric_uncertainty=aleatoric_uncertainty,
+                epistemic_uncertainty=epistemic_uncertainty,
+                entropy=entropy,
+                selected_log_probs=selected_log_probs,
+                selected_probs=selected_probs,
+                selected_perplexity=selected_perplexity,
+            )
 
-        output_tokens, first_decode_output = run_decoding(
+            return output_tokens_local, out_step0, insight_metrics
+
+        output_tokens, first_decode_output, insight_metrics = run_decoding(
             prefix_emb_unaligned
         )
 
@@ -714,6 +807,8 @@ class Pi0FAST(_model.BaseModel):
             score_fn=score_fn,
 
             first_decode_output=first_decode_output,
+
+            insight_metrics=insight_metrics,
 
             max_decoding_steps=max_decoding_steps,
         )

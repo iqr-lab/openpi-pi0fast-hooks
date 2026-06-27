@@ -12,6 +12,7 @@ hooks:
     - prefix_gradients
     - raw_attention_weights
     - value_vectors
+    - insight_metrics
 
   action_chunks:
     num_chunks: 1

@@ -38,6 +38,8 @@ def collect_hook_data(
 
     first_decode_output,
 
+    insight_metrics,
+
     max_decoding_steps,
 ):
     data = {
@@ -62,6 +64,8 @@ def collect_hook_data(
         "meta": meta,
 
         "actions": actions,
+
+        "insight_metrics": insight_metrics,
     }
 
     if is_hook_enabled("token_spans"):
