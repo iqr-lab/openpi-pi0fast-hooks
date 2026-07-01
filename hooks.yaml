@@ -10,12 +10,14 @@ hooks:
     - prefix_embeddings
     - prefix_final_hidden_state
     - prefix_gradients
+    - action_chunks
     - raw_attention_weights
     - value_vectors
     - insight_metrics
 
   action_chunks:
-    num_chunks: 1
+    num_chunks: 8
+    ace_temperature: 0.7
 
   raw_attention_weights:
     layers: [1, 16]

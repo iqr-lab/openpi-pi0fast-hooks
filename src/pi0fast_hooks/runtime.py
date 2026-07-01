@@ -1,4 +1,4 @@
-from pi0fast_hooks.hook_runner import is_hook_enabled
+from pi0fast_hooks.hook_runner import get_hook_config, is_hook_enabled
 
 from pi0fast_hooks.computations.token_spans import compute_token_spans
 from pi0fast_hooks.computations.action_chunks import compute_action_chunks
@@ -76,10 +76,13 @@ def collect_hook_data(
         )
 
     if is_hook_enabled("action_chunks"):
+        cfg = get_hook_config().get("action_chunks", {})
         data["action_chunks"] = compute_action_chunks(
             rng=rng,
             run_decoding=run_decoding,
             prefix_embeddings=prefix_embeddings,
+            num_chunks=cfg.get("num_chunks", 8),
+            ace_temperature=cfg.get("ace_temperature", 0.7),
         )
 
     if is_hook_enabled("prefix_gradients"):

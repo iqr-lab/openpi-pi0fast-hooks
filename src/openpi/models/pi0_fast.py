@@ -487,7 +487,15 @@ class Pi0FAST(_model.BaseModel):
 
             return jnp.sum(chosen)
 
-        def run_decoding(prefix_emb_unaligned_for_run):
+        def run_decoding(
+            prefix_emb_unaligned_for_run,
+            *,
+            decode_rng=None,
+            decode_temperature=None,
+        ):
+            local_temperature = temperature if decode_temperature is None else decode_temperature
+            local_rng = rng if decode_rng is None else decode_rng
+
             attn_unaligned = make_attn_mask(
                 prefix_mask_unaligned,
                 prefix_ar_mask_unaligned,
@@ -519,12 +527,12 @@ class Pi0FAST(_model.BaseModel):
 
             last_logit_local = logits[:, -1:]
 
-            rng_local, rng_step0 = jax.random.split(rng)
+            rng_local, rng_step0 = jax.random.split(local_rng)
 
-            if temperature > 0.0:
+            if local_temperature > 0.0:
                 token_0 = jax.random.categorical(
                     rng_step0,
-                    last_logit_local / temperature,
+                    last_logit_local / local_temperature,
                     axis=-1,
                 )
             else:
@@ -630,10 +638,10 @@ class Pi0FAST(_model.BaseModel):
                 )
 
                 token = jax.lax.cond(
-                    temperature > 0.0,
+                    local_temperature > 0.0,
                     lambda _: jax.random.categorical(
                         rng_step,
-                        last_logit_carry / temperature,
+                        last_logit_carry / local_temperature,
                         axis=-1,
                     ),
                     lambda _: jnp.argmax(
@@ -774,13 +782,21 @@ class Pi0FAST(_model.BaseModel):
 
             return output_tokens_local, out_step0, insight_metrics
 
+        # Keep rollout behavior unchanged. This is the action chunk returned to the
+        # environment. Use the original rng for rollout so nonzero-temperature
+        # behavior is bit-for-bit compatible with the old code path; derive a
+        # separate key only for hook-side stochastic sampling.
+        rollout_rng = rng
+        _, hook_rng = jax.random.split(rng)
         output_tokens, first_decode_output, insight_metrics = run_decoding(
-            prefix_emb_unaligned
+            prefix_emb_unaligned,
+            decode_rng=rollout_rng,
+            decode_temperature=temperature,
         )
 
         hook_data = collect_hook_data(
             model=self,
-            rng=rng,
+            rng=hook_rng,
             observation=observation,
 
             prefix_embeddings=prefix_emb_unaligned,
