@@ -1,79 +1,159 @@
 # pi0-fast hooks technical documentation
 
-This document describes the hook framework implemented for `pi0_fast.py`, explains what each hook records at the model level.
+This document explains the hook framework implemented around `src/openpi/models/pi0_fast.py`, how each hook maps onto the π0-FAST model, and what each recorded tensor means technically.
+
+It is grounded in the FAST paper, "FAST: Efficient Action Tokenization for Vision-Language-Action Models" (`2501.09747v1.pdf`), and in the current repo implementation.
+
+## Executive summary
+
+The hooks are implemented consistently with this repo's π0-fast architecture.
+
+The most important interpretation rule is:
+
+```text
+Inside pi0_fast.py, decoded "actions" are still autoregressive token IDs.
+Continuous robot actions appear only after ExtractFASTActions detokenizes them.
+```
+
+So:
+
+- `outputs/actions` in a recorded policy step are continuous robot actions after output transforms.
+- `hook_data["actions"]`, `action_chunks`, `insight_metrics`, and decode-loop internals are token-space objects.
+- Attention, value-vector, embedding, and gradient hooks are prefix-internal model probes. They should be interpreted with `token_spans`.
+
+No hook currently computes ACE/FIPER statistics directly. `action_chunks` records sampled token chunks only. If you want continuous-action uncertainty, detokenize sampled chunks with the same FAST tokenizer and then compute statistics over the executed horizon.
+
+## Paper context: what π0-FAST is doing
+
+The FAST paper's core point is that autoregressive VLAs need a good discrete representation of continuous action chunks. A robot policy predicts a future action chunk:
+
+```text
+a_1:H
+```
+
+where `H` is the action horizon. Instead of predicting each continuous action dimension directly, FAST maps the continuous action chunk into a shorter sequence of discrete tokens:
+
+```text
+T_a(a_1:H) = [T_1, ..., T_n]
+```
+
+The paper argues that naive per-dimension, per-timestep binning creates highly redundant token sequences for high-frequency robot control. FAST reduces that redundancy by:
+
+1. Normalizing the continuous action chunk.
+2. Applying a discrete cosine transform (DCT) per action dimension.
+3. Quantizing the frequency coefficients.
+4. Flattening low-frequency coefficients first.
+5. Compressing the integer coefficient stream with BPE.
+
+π0-FAST then uses a PaliGemma/Gemma-style autoregressive VLA to generate those action tokens with ordinary next-token prediction. The generated tokens are later detokenized back into a continuous action chunk.
+
+In this repo, `FASTTokenizer` wraps that process:
+
+- `TokenizeFASTInputs` turns task text and robot state into prefix tokens.
+- During training, action chunks are converted into FAST action tokens and appended after an `Action:` marker.
+- During inference, `Pi0FAST.sample_actions` generates model-vocabulary token IDs.
+- `ExtractFASTActions` casts generated tokens to `int32`, parses the generated action text, converts PaliGemma token IDs back into FAST action-token IDs, and decodes them into continuous actions.
+
+This means token-level hooks are probing the autoregressive action-token process described by the FAST paper, not the final continuous action vectors directly.
 
 ## End-to-end hook flow
 
 The capture path is:
 
-1. `Policy.infer(...)` calls the jitted `Pi0FAST.sample_actions(...)`.
-2. `sample_actions` preprocesses the observation, embeds the multimodal prefix, fills the LLM KV cache, decodes FAST action tokens, and returns:
+1. `Policy.infer(...)` builds an `Observation` and calls the jitted `Pi0FAST.sample_actions(...)`.
+2. `sample_actions(...)` preprocesses the observation, builds a multimodal prefix, fills the Gemma KV cache, decodes FAST action tokens, and returns:
 
    ```python
    output_tokens, hook_data
    ```
 
-3. `Policy.infer(...)` separates those two values. The output transform later detokenizes `output_tokens` into continuous actions.
-4. `emit_all(hook_data)` runs outside the jitted model call and builds Python hook records:
+3. `Policy.infer(...)` separates `output_tokens` from `hook_data`.
+4. Output transforms run. For π0-fast, `ExtractFASTActions` converts `output_tokens` into continuous robot actions.
+5. `emit_all(hook_data)` runs outside the jitted model call and builds records:
 
    ```python
    {"hook_name": name, "data": payload}
    ```
 
-5. `PolicyRecorder` saves the original inputs, final outputs, and hook records to `.npy`.
+6. `PolicyRecorder` saves original inputs, final outputs, and hook records.
 
-This split is important: hook records are built outside JIT, but the contents of `hook_data` must still be JAX-pytree-safe because they come out of `sample_actions`.
+The split is intentional. Hook records are Python dictionaries with string names, so they are built outside JIT. However, the contents of `hook_data` still come out of a jitted function, so they must be JAX-pytree-safe.
 
-## pi0-fast model context
+## π0-fast model context
 
-Inside `Pi0FAST.sample_actions`, the model builds a prefix from:
+`Pi0FAST.sample_actions(...)` builds the prefix from:
 
 - image patch embeddings from the SigLIP image tower,
-- task text tokens embedded by the PaliGemma/Gemma token embedding table,
-- state text tokens, where robot state has been discretized into textual/token form by the FAST input tokenizer.
+- task text tokens embedded by the Gemma token embedding table,
+- state text tokens embedded by the Gemma token embedding table.
 
-The hook implementation uses `embed_inputs_with_spans(...)`, which intentionally separates task and state spans instead of treating the full prompt/state string as one opaque text segment. For typical LIBERO pi0-fast runs, the prefix looks like:
+For a typical LIBERO run, the prefix layout is:
 
 ```text
-image tokens | task text tokens | state text tokens
+base image patches | left wrist image patches | right wrist image patches | task text | state text
 ```
 
-The model then:
+Then the model:
 
 1. Builds a prefix attention mask.
-2. Right-aligns the prefix for Gemma-style decoding.
-3. Runs a prefix prefill pass to create a KV cache.
-4. Uses the final prefix logit to predict the first FAST action token.
-5. Continues autoregressive decoding one token at a time until EOS or `max_decoding_steps`.
+2. Right-aligns the prefix for Gemma decode-cache behavior.
+3. Runs a prefix prefill pass to create the KV cache.
+4. Uses the final prefix logit distribution to choose the first generated token.
+5. Feeds generated tokens back through the LLM one at a time until EOS or `max_decoding_steps`.
 
-The final output of `sample_actions` is still token-space. The policy output transform, `ExtractFASTActions`, casts those tokens to `int32` and detokenizes them into continuous action arrays.
+The default `max_decoding_steps` is 256. This is a token-buffer length, not the number of continuous robot actions. In LIBERO you may see `outputs/actions` with shape `(10, 7)` while token hooks have length 256. Those are different spaces:
+
+```text
+token sequence length -> FAST/PaliGemma decoding
+continuous action horizon -> post-detokenization robot control
+```
 
 ## Correctness audit summary
 
-The hooks are implemented correctly for the current pi0-fast architecture, with the caveats listed in this document.
+The current hooks are technically consistent with the repo's π0-fast implementation.
 
-Key correctness points verified:
+Verified points:
 
 - Hook-only stochastic action sampling does not replace rollout actions.
-- `run_decoding(...)` accepts `decode_rng` and `decode_temperature`, and sampling consistently uses `local_temperature`.
-- The actual rollout uses the original RNG:
+- `run_decoding(...)` accepts `decode_rng` and `decode_temperature`.
+- Sampling checks and divides by the same `local_temperature`.
+- The rollout uses the original RNG:
 
   ```python
   rollout_rng = rng
   _, hook_rng = jax.random.split(rng)
   ```
 
-  This preserves rollout behavior while giving hooks an independent RNG.
+  This preserves rollout behavior, including nonzero-temperature behavior, while giving hooks separate randomness.
 
-- `action_chunks` records sampled decoded token chunks only. It does not compute ACE/FIPER variance.
-- `raw_attention_weights` uses `first_decode_output["attn_rows"]` from the first decoded action token step and slices to prefix keys.
-- `value_vectors` reads Gemma Fast value cache from `kv_cache[2]`, which is correct for this repo's `gemma_fast.KVCache = (idx, key_cache, value_cache)`.
-- Layer selection supports `layers: null`, `layers: "all"`, or a list like `[1, 16]`.
-- Hook registration and emission go through `pi0fast_hooks.hook_runner`.
+- `action_chunks` records extra sampled token chunks only. It does not compute ACE/FIPER variance.
+- `raw_attention_weights` reads `first_decode_output["attn_rows"]` and slices to prefix keys.
+- `value_vectors` correctly reads Gemma Fast's value cache from `kv_cache[2]`, because Gemma Fast uses `(idx, key_cache, value_cache)`.
+- Layer selection supports `layers: null`, `layers: "all"`, or a list such as `[1, 16]`.
+- Hook records are emitted by registered hook emitters through `pi0fast_hooks.hook_runner`.
 
-## Configuration semantics
+Important caveat:
 
-The main config lives in `hooks.yaml`.
+- `raw_attention_weights` captures the first generated token's decode attention row, not the prefix prefill row that predicted that token. More detail is in the hook section below.
+
+## Hook registration and configuration
+
+The main runtime pieces are:
+
+- `src/pi0fast_hooks/hook_runner.py`
+- `src/pi0fast_hooks/runtime.py`
+- `src/pi0fast_hooks/hooks/*.py`
+- `src/pi0fast_hooks/computations/*.py`
+
+`hook_runner.py` stores:
+
+- enabled hook names,
+- hook-specific config,
+- registered emitters.
+
+`emit_all(data)` sorts enabled hook names alphabetically before emission. Record order is therefore alphabetical, not the order in `hooks.yaml`.
+
+Example config:
 
 ```yaml
 hooks:
@@ -99,46 +179,43 @@ hooks:
     layers: [1, 16]
 ```
 
-For `raw_attention_weights` and `value_vectors`:
+Layer selection semantics:
 
 - `layers: null` means all layers.
-- `layers: "all"` also means all layers.
+- `layers: "all"` means all layers.
 - `layers: [1, 16]` means only those layer indices.
 
-For `action_chunks`:
+Because hook checks happen inside a jitted `sample_actions` path, hook configuration should be set before policy creation / first inference. Treat it as compile-time configuration for a given policy process.
 
-- `num_chunks` is the number of hook-only sampled decoded token chunks.
-- `ace_temperature` is currently just the hook sampling temperature. The name remains from the FIPER/ACE use case, but no ACE metric is computed in this hook.
+## Shared notation and shapes
 
-## Hook runner
+Common dimensions:
 
-Source:
+- `B`: batch size.
+- `P`: prefix token count.
+- `D`: Gemma hidden width. For Gemma 2B, this is typically 2048.
+- `L`: number of transformer layers. Gemma 2B here uses 18 layers.
+- `H`: number of attention heads. The example output uses 8.
+- `KVH`: number of KV heads. The example output uses 1.
+- `HD`: attention head dimension. The example output uses 256.
+- `T`: `max_decoding_steps`, default 256.
 
-- `src/pi0fast_hooks/hook_runner.py`
+Common observed LIBERO-like shapes:
 
-Purpose:
-
-- Stores enabled hook names.
-- Stores hook-specific config.
-- Registers hook emitters.
-- Converts `hook_data` into a list of hook records.
-- Logs INFO messages when capture starts, each hook is captured, and capture completes.
-
-Technical behavior:
-
-```python
-records = emit_all(hook_data)
+```text
+prefix_embeddings:          [B, P, D]
+prefix_final_hidden_state:  [B, P, D]
+prefix_gradients:           [B, P, D]
+action_chunks:              [num_chunks, B, T]
+insight metric fields:      [B, T]
+raw attention weights:      [L_selected, B, H, P]
+raw attention v_cache:      [L_selected, B, P, KVH, HD]
+value vectors:              [B, L_selected, P, KVH, HD]
 ```
 
-The runner sorts enabled hook names before emission, so record order is alphabetical by hook name, not necessarily the order in `hooks.yaml`.
+## Hook: `observation_input`
 
-Caveat:
-
-- If an enabled hook has no registered emitter, `emit_all` raises `ValueError`.
-
-## `observation_input`
-
-Source:
+Sources:
 
 - `src/pi0fast_hooks/hooks/observation_input.py`
 
@@ -154,25 +231,32 @@ Captures:
 
 Conceptual meaning:
 
-This is the policy input after OpenPI input transforms have converted raw environment observations into model-ready arrays. It is not necessarily the raw robot sensor packet. Images are already keyed as model camera inputs, state is normalized/preprocessed as configured, and prompt text has already been tokenized.
+This records the model-ready observation after OpenPI input transforms have run. It is not necessarily the raw simulator or robot packet.
 
 In the VLA:
 
-- `images` are later embedded by SigLIP into visual patch tokens.
-- `state` has already contributed to tokenized prompt/state fields through `TokenizeFASTInputs`.
-- `prompt` here is the tokenized task/state prompt array, not the original natural language string.
+- `images` are passed through SigLIP and become visual patch tokens.
+- `state` is the continuous state array after policy preprocessing.
+- `prompt` is the tokenized prompt/state sequence, not the original natural-language string.
 
 Expected shapes:
 
-- `images[name]`: `[batch, height, width, channels]`
-- `state`: `[batch, state_dim]`
-- `prompt`: `[batch, max_token_len]`
+```text
+images[name]: [B, height, width, channels]
+state:        [B, state_dim]
+prompt:       [B, max_token_len]
+```
+
+Correctness assessment:
+
+- Correctly implemented as a light input snapshot.
+- Correctly emitted outside JIT.
 
 Caveat:
 
-- If you need exact original text, save the pre-tokenization input separately. This hook records tokenized prompt IDs.
+- If you need the original unsanitized text prompt, record it before `TokenizeFASTInputs`. This hook records token IDs.
 
-## `token_spans`
+## Hook: `token_spans`
 
 Sources:
 
@@ -192,9 +276,9 @@ Captures:
 
 Conceptual meaning:
 
-This hook is the map from prefix token positions to semantic modalities. It tells you which prefix indices correspond to:
+This hook maps prefix token indices back to semantic input regions:
 
-- each camera stream,
+- each camera's image patches,
 - task text,
 - state text.
 
@@ -214,18 +298,26 @@ Example:
 
 In the VLA:
 
-This is essential for interpreting attention, gradients, and value vectors. Without spans, an attention weight at key index 533 is just an index; with spans, it can be assigned to a camera patch, task token, or state token.
+This is the indexing map that makes attention, value vectors, embeddings, and gradients interpretable. Without spans, key index 533 is just an integer. With spans, it can be attributed to a camera stream and image patch location.
 
-Expected fields:
+Expected metadata:
 
-- `prefix_num_tokens`: total prefix sequence length seen by the LLM.
-- `meta["image_grids"][camera]`: patch grid, often `(16, 16)` for 224x224 images with 14x14 patches.
+```python
+meta["image_grids"][camera] == (patch_rows, patch_cols)
+```
+
+For 224x224 images with 14x14 patches, this is often `(16, 16)`.
+
+Correctness assessment:
+
+- Correctly constructed from the same modality concatenation that builds the prefix.
+- Correctly records task and state spans separately, which is necessary for π0-fast because state is represented as text/discrete state tokens in the prompt.
 
 Caveat:
 
-- Spans are over the unaligned prefix construction. In common LIBERO cases there is no prefix padding after task/state splitting, so these align directly with cache keys. If missing cameras or unusual masks are used, always interpret spans together with `prefix_mask`.
+- Spans are defined over the unaligned prefix construction. Most LIBERO runs have no text padding after task/state splitting, so they align naturally with prefix keys. For unusual masks or missing cameras, interpret spans together with `prefix_mask`.
 
-## `prefix_embeddings`
+## Hook: `prefix_embeddings`
 
 Sources:
 
@@ -238,33 +330,40 @@ Captures:
 prefix_embeddings
 ```
 
-Conceptual meaning:
-
-These are the multimodal input embeddings before transformer layers:
-
-- SigLIP image patch embeddings projected into the Gemma width,
-- task token embeddings from the LLM token embedding table,
-- state token embeddings from the LLM token embedding table.
-
 Expected shape:
 
-```python
-[batch, prefix_tokens, hidden_dim]
+```text
+[B, P, D]
 ```
 
-For Gemma 2B pi0-fast, `hidden_dim = 2048`.
+Conceptual meaning:
+
+These are the multimodal input embeddings before the Gemma transformer layers. They include:
+
+- projected SigLIP image patch embeddings,
+- task token embeddings,
+- state token embeddings.
 
 In the VLA:
 
-This hook answers: "What vector sequence did the transformer receive as context before action-token decoding?"
+This hook answers:
+
+```text
+What vector sequence did the transformer receive as context before autoregressive action-token decoding?
+```
+
+Correctness assessment:
+
+- Correctly records the unaligned prefix embeddings used as the canonical semantic prefix sequence.
+- Correctly pairs with `token_spans`.
 
 Caveats:
 
 - These are not contextualized hidden states.
-- They do not include the per-layer attention value vectors. Use `value_vectors` for V projections.
-- They are pre-transformer representations, so image-language-state fusion has not happened yet.
+- They do not contain per-layer attention value projections. Use `value_vectors` for that.
+- If you analyze against cache keys in unusual padded cases, account for alignment and `prefix_mask`.
 
-## `prefix_final_hidden_state`
+## Hook: `prefix_final_hidden_state`
 
 Sources:
 
@@ -275,6 +374,12 @@ Captures:
 
 ```python
 prefix_final_hidden_state
+```
+
+Expected shape:
+
+```text
+[B, P, D]
 ```
 
 Implementation capture point:
@@ -290,23 +395,23 @@ prefix_final_hidden_state, _, _ = self.PaliGemma.llm(
 
 Conceptual meaning:
 
-This records the contextualized prefix representation after the Gemma transformer and final RMSNorm, before vocabulary decoding. It is the final hidden state sequence for all prefix tokens.
-
-Expected shape:
-
-```python
-[batch, prefix_tokens, hidden_dim]
-```
+This is the final normalized Gemma hidden state for the prefix after multimodal self-attention. It is the representation immediately before vocabulary decoding.
 
 In the VLA:
 
-This is where image, task, and state context have been fused by self-attention. The final prefix token's hidden state is what produces the logit distribution for the first action token.
+This is where image, task, and state context have been fused. The final prefix position's hidden state produces the logit distribution for the first generated token.
 
-Caveat:
+Correctness assessment:
 
-- This is from a second non-cache prefix forward pass used for hook capture. It should match the prefix hidden representation conceptually, but it is not the same object as the cached values used in the decode loop.
+- Correctly captures final prefix hidden representations via `return_prelogits=True`.
+- Correctly avoids generated action tokens; it is prefix-only.
 
-## `prefix_gradients`
+Caveats:
+
+- This is computed by a second prefix-only forward pass for hook capture, not by directly returning the hidden state from the cached prefill call.
+- It uses the aligned prefix. In common no-padding cases this is equivalent for indexing. With padding/masks, use `prefix_mask_aligned` and `token_spans` carefully.
+
+## Hook: `prefix_gradients`
 
 Sources:
 
@@ -322,37 +427,48 @@ grads = d score / d prefix_embeddings
 
 Objective:
 
-The score is the summed logit of the selected first decoded token:
-
 ```python
 target_token = argmax(first_step_logits)
 score = first_step_logits[target_token]
 ```
 
-Conceptual meaning:
-
-This is a token-level saliency hook. It answers:
-
-"If I infinitesimally perturb each prefix embedding, how much would the first action-token logit change?"
+where `first_step_logits` are the final-prefix logits that choose the first generated token.
 
 Expected shape:
 
-```python
-[batch, prefix_tokens, hidden_dim]
+```text
+[B, P, D]
+```
+
+Conceptual meaning:
+
+This is first-token saliency. It asks:
+
+```text
+If each prefix embedding changed infinitesimally, how would the selected first-token logit change?
 ```
 
 In the VLA:
 
-Use it to measure sensitivity of the first action-token decision to image patches, task tokens, and state tokens. Combine with `token_spans` to aggregate saliency by modality or camera.
+Use it to estimate sensitivity of the first autoregressive action-token decision to image patches, task text, and state text. Aggregate over hidden dimension, then use `token_spans` to aggregate by modality:
+
+```python
+saliency = jnp.linalg.norm(prefix_gradients, axis=-1)
+```
+
+Correctness assessment:
+
+- Correctly differentiates the selected first-token logit with respect to unaligned prefix embeddings.
+- Correctly recomputes alignment inside `score_fn`, so the gradient objective follows the same prefix-preprocessing path.
 
 Caveats:
 
-- It explains the first decoded action token only, not the whole action chunk.
-- It is gradient saliency, not causal attribution.
+- It is not full-chunk attribution.
+- It is not causal intervention.
 - It can be expensive because it differentiates through a prefix forward pass.
-- If the model decodes with temperature, the gradient target remains the greedy argmax token from the prefix logit unless you change the target construction.
+- If rollout temperature is nonzero, this hook still targets the greedy prefix token unless the target construction is changed.
 
-## `action_chunks`
+## Hook: `action_chunks`
 
 Sources:
 
@@ -368,17 +484,19 @@ jnp.stack(chunks, axis=0)
 
 Expected shape:
 
-```python
-[num_chunks, batch, max_decoding_steps]
+```text
+[num_chunks, B, T]
 ```
+
+where `T = max_decoding_steps`, usually 256.
 
 Conceptual meaning:
 
-This hook samples extra autoregressive FAST token sequences from the same prefix context. These are hook-only samples. They are not the actions executed by the environment.
+This hook samples alternate autoregressive token completions from the same prefix context. These are hook-only samples. They are not the actions executed by the environment.
 
 Correctness details:
 
-- The rollout uses `rollout_rng = rng`.
+- The actual rollout uses `rollout_rng = rng`.
 - Hook samples use `hook_rng`.
 - Each sampled chunk uses a separately split RNG.
 - Hook sampling uses `decode_temperature=ace_temperature`.
@@ -386,17 +504,34 @@ Correctness details:
 
 In the VLA:
 
-These chunks are alternate discrete action-token completions for the current observation and prompt. They are useful for token-space uncertainty baselines and for later detokenization-based continuous-action analyses.
+These chunks are alternate generated PaliGemma vocabulary token sequences for the current observation and prompt. They may include the `Action:` marker, FAST action-token text, delimiter, EOS, and trailing zeros after EOS.
+
+They are not directly:
+
+- 5 actions,
+- 10 actions,
+- continuous action vectors,
+- one token per action dimension.
+
+To use them for continuous-action uncertainty:
+
+1. Cast token IDs to `int32`.
+2. Detokenize each sequence using the same `FASTTokenizer.extract_actions(...)` path.
+3. Compute statistics over the desired executed horizon, such as first 5 actions for a `replan_steps=5` rollout.
+
+Correctness assessment:
+
+- Correctly hook-only.
+- Correctly stochastic when `ace_temperature > 0`.
+- Correctly returns sampled chunks only; no ACE/FIPER calculation is embedded.
 
 Caveats:
 
-- These are token sequences, not continuous actions.
-- The buffer length is `max_decoding_steps`, often 256, not the action horizon.
-- EOS often appears long before `max_decoding_steps`; positions after EOS remain zeros.
-- Values may be saved as float arrays because the decode buffer is initialized as a floating array and later cast by `ExtractFASTActions`. Treat nonzero values as token IDs and cast to `int32` before detokenizing or doing token-level analysis.
-- No ACE/FIPER statistic is computed here by design. The hook returns sampled chunks only.
+- Values may be saved as `float32` because the decode buffer is initialized with `jnp.zeros(...)`. Treat nonzero values as token IDs and cast to `int32` before detokenization.
+- EOS often appears before 256 tokens; trailing zeros are expected.
+- `num_chunks: 1` means shape `[1, B, T]`; it does not mean one continuous action.
 
-## `raw_attention_weights`
+## Hook: `raw_attention_weights`
 
 Sources:
 
@@ -420,40 +555,61 @@ Captures:
 
 Expected shapes:
 
-```python
-weights: [layers, batch, heads, prefix_keys]
-v_cache: [layers, batch, prefix_keys, kv_heads, head_dim]
+```text
+weights: [L_selected, B, H, P]
+v_cache: [L_selected, B, P, KVH, HD]
 ```
 
 Conceptual meaning:
 
-This hook records the attention distribution from the first decoded action-token step back onto prefix keys. In `gemma_fast`, each attention block returns the last query row:
+This hook records attention distributions from the first generated token's decode pass back onto prefix keys. In `gemma_fast`, each attention block returns:
 
 ```python
 attn_last_row = probs_full[:, :, -1, :]
 ```
 
-During the first decode step, that row is the attention pattern of the first generated FAST action token.
+The current `first_decode_output` is `out_step0`, produced when the model feeds the first generated token back into the LLM to get logits for the next token. The hook then slices attention rows to prefix length:
+
+```python
+attn_rows = attn_rows[..., :prefix_len]
+```
+
+So this hook answers:
+
+```text
+While processing the first generated token, which prefix tokens did each layer/head attend to?
+```
+
+It does not answer:
+
+```text
+Which prefix tokens did the final prefix position attend to when predicting the first token?
+```
+
+That would require separately capturing the prefix prefill output.
 
 In the VLA:
 
-Use this to ask: "When producing the first action token, which prefix tokens did each layer/head attend to?"
-
-The prefix keys can be mapped back to camera/task/state spans using `token_spans`.
+Use this to inspect prefix readout by the first generated action-token step. Combine with `token_spans` to aggregate attention by camera/task/state.
 
 Layer selection:
 
-- `layers: null` or `"all"` records all 18 Gemma 2B layers.
-- `layers: [1, 16]` records only layers 1 and 16.
+- `layers: null` or `"all"` records all layers.
+- `layers: [1, 16]` records only those layers.
+
+Correctness assessment:
+
+- Correctly captures Gemma Fast's layer-stacked attention rows.
+- Correctly slices to prefix keys so generated-token/self keys are excluded from this hook.
+- Correctly applies selected-layer indexing.
 
 Caveats:
 
-- This is attention for the first decoded token only, not every decoded token.
-- Shape is layer-first, unlike `value_vectors`, which is batch-first. This is intentional in the current code but should be remembered when analyzing records.
-- Attention weights are not explanations by themselves. They show routing probabilities, not causal contribution.
-- The hook currently also includes `v_cache`, which duplicates part of `value_vectors` in layer-first form. For clean value-vector analysis, prefer the dedicated `value_vectors` hook.
+- Attention weights are routing probabilities, not causal explanations.
+- This is a first-decode-step hook, not full-sequence attention.
+- It includes `v_cache` in layer-first form, duplicating part of the dedicated `value_vectors` hook. Prefer `value_vectors` for value-vector analyses.
 
-## `value_vectors`
+## Hook: `value_vectors`
 
 Sources:
 
@@ -475,13 +631,18 @@ Captures:
 
 Expected shape:
 
-```python
-vectors: [batch, layers, prefix_keys, kv_heads, head_dim]
+```text
+vectors: [B, L_selected, P, KVH, HD]
 ```
 
 Conceptual meaning:
 
-This hook records per-layer attention value vectors generated from the prefix tokens. In transformer attention, keys determine where a query attends; values determine what content is read out once attention weights are applied.
+In transformer attention:
+
+- keys decide where a query attends,
+- values provide the content that is read out.
+
+This hook records the per-layer value-cache vectors produced by prefix tokens. These are the token-level content vectors available to action-token decode queries.
 
 In Gemma Fast, the cache is:
 
@@ -495,23 +656,33 @@ so this hook correctly reads:
 value_cache = kv_cache[2]
 ```
 
-This differs from pi0.5's Gemma cache, where the value cache is at `kv_cache[1]`.
+This differs from pi0.5-style Gemma caches where values may live at `kv_cache[1]`.
 
 In the VLA:
 
-Use `value_vectors` to study what token-level content is available for action-token decoding at each layer. Combine with `raw_attention_weights` if you want to reconstruct or approximate attention readout patterns:
+Use `value_vectors` to study what image/task/state content is available at each prefix key and layer. Combining attention weights and value vectors gives the attention readout ingredients:
 
 ```text
-attention weights over prefix keys x value vectors at those keys
+attention weights over prefix keys x value vectors at prefix keys
 ```
+
+Correctness assessment:
+
+- Correctly uses the prefix KV cache, not input embeddings.
+- Correctly uses `kv_cache[2]` for this repo's Gemma Fast cache layout.
+- Correctly transposes to batch-first shape, matching the pi0.5-style convention:
+
+  ```text
+  [B, L, P, KVH, HD]
+  ```
 
 Caveats:
 
-- Values are prefix-only. Generated action-token values are excluded by slicing to `prefix_len`.
-- Values are not normalized attribution scores.
-- For missing or invalid camera tokens, use `prefix_mask` and `token_spans` during analysis.
+- Values are prefix-only. Generated-token values are excluded by slicing to `prefix_len`.
+- Value vectors are not attribution scores.
+- Use `prefix_mask`/`token_spans` for masked or missing modalities.
 
-## `insight_metrics`
+## Hook: `insight_metrics`
 
 Sources:
 
@@ -534,91 +705,55 @@ Captures:
 
 Expected shape for each field:
 
-```python
-[batch, max_decoding_steps]
+```text
+[B, T]
 ```
 
 Conceptual meaning:
 
-This hook records scalar diagnostics for the actual rollout decode at each decoded FAST token position.
+This hook records token-level confidence and uncertainty diagnostics for the actual rollout decode.
 
 Fields:
 
-- `entropy`: categorical entropy of the vocabulary distribution for that decode step.
+- `entropy`: categorical entropy over the full vocabulary at that decode step.
 - `selected_probs`: probability of the token actually selected.
 - `selected_log_probs`: log probability of the selected token.
 - `selected_perplexity`: `exp(-selected_log_prob)`.
-- `aleatoric_uncertainty`: LogU aleatoric uncertainty computed from the top-k logits.
-- `epistemic_uncertainty`: LogU epistemic uncertainty computed from the top-k logits.
+- `aleatoric_uncertainty`: LogU aleatoric uncertainty over top-k logits.
+- `epistemic_uncertainty`: LogU epistemic uncertainty over top-k logits.
 
 In the VLA:
 
-These are token-level uncertainty and confidence measures for the discrete action-token generation process. They correspond to the real decoded rollout tokens, not hook-only sampled chunks.
+These metrics describe uncertainty in autoregressive token generation. They are aligned with the actual rollout token sequence, not the hook-only samples from `action_chunks`.
+
+Correctness assessment:
+
+- Correctly computed inside the decode loop for the actual rollout.
+- Correctly tracks the same selected tokens that are written into the rollout token buffer.
+- Correctly uses `local_temperature` for stochastic sampling while metrics are computed from the current logits.
 
 Caveats:
 
-- Metrics after EOS remain zero because the tracker arrays are preallocated.
-- These metrics are over the PaliGemma/FAST token vocabulary, not directly over continuous robot action dimensions.
-- Token-level uncertainty may not align perfectly with continuous action uncertainty after detokenization.
+- Metrics after EOS remain zero because arrays are preallocated.
+- These are token-distribution metrics, not continuous-action uncertainty.
 - LogU is a heuristic over logits, not a calibrated Bayesian posterior.
 
-## Comparison with pi0.5 hooks
+## Relationship to policy outputs
 
-The pi0.5 hook repo provides a useful reference but the model mechanics differ.
+There are three different action-like objects:
 
-### Action generation
+```text
+1. output_tokens inside sample_actions
+   Generated PaliGemma token IDs. Token-space.
 
-pi0.5:
+2. action_chunks hook
+   Alternate sampled generated token sequences. Token-space.
 
-- Prefix contains image/language/state.
-- Suffix contains continuous action tokens/noise embeddings.
-- The policy denoises an action array through a flow-matching loop.
-- `action_chunks` can sample alternate Gaussian noise seeds and rerun denoising, producing continuous action chunks.
-
-pi0-fast:
-
-- Prefix contains image/task/state token context.
-- Actions are predicted as discrete FAST token sequences.
-- `action_chunks` samples alternate autoregressive token completions.
-- Detokenization happens outside the model output through `ExtractFASTActions`.
-
-### Attention hooks
-
-pi0.5:
-
-- Raw attention can be recorded for action suffix tokens attending to prefix keys.
-- Shape includes suffix query length:
-
-  ```python
-  [batch, layers, heads, suffix_len, prefix_keys]
-  ```
-
-pi0-fast:
-
-- The current hook records only the first decoded FAST action-token attention row.
-- Shape is:
-
-  ```python
-  [layers, batch, heads, prefix_keys]
-  ```
-
-This is correct for the current pi0-fast hook objective, but it is not a full action-sequence attention tensor.
-
-### Value vectors
-
-pi0.5:
-
-```python
-value_cache = kv_cache[1]
+3. outputs/actions in PolicyRecorder output
+   Continuous actions after ExtractFASTActions. Robot-control space.
 ```
 
-pi0-fast:
-
-```python
-value_cache = kv_cache[2]
-```
-
-The pi0-fast implementation is correct because Gemma Fast stores `(idx, key_cache, value_cache)`.
+Do not compare `action_chunks` directly against `outputs/actions` without detokenizing sampled chunks.
 
 ## Practical analysis recipes
 
@@ -626,57 +761,63 @@ The pi0-fast implementation is correct because Gemma Fast stores `(idx, key_cach
 
 1. Load `raw_attention_weights["weights"]`.
 2. Load `token_spans["spans"]`.
-3. For each span, sum or average weights over that key range.
-4. Compare image-camera, task, and state attention per layer/head.
+3. For each span, sum or average attention over the key range.
+4. Compare camera/task/state attention per layer and head.
 
 ### Aggregate gradient saliency by modality
 
 1. Load `prefix_gradients`.
-2. Compute a norm over hidden dimension:
+2. Compute:
 
    ```python
-   saliency = ||grad||_2 over hidden_dim
+   saliency = np.linalg.norm(prefix_gradients, axis=-1)
    ```
 
-3. Aggregate by spans from `token_spans`.
+3. Aggregate saliency over spans from `token_spans`.
 
 ### Study token-level rollout uncertainty
 
 1. Load `insight_metrics`.
-2. Find the first EOS token position from the rollout token sequence.
-3. Analyze metrics only before EOS.
-4. Compare entropy or selected probability across timesteps.
+2. Find EOS in the rollout token sequence.
+3. Analyze only pre-EOS positions.
+4. Compare entropy, selected probability, or selected perplexity over decode positions.
 
 ### Use action chunks for FIPER-style baselines
 
 1. Load `action_chunks`.
 2. Cast sampled token IDs to `int32`.
-3. Detokenize each sampled token sequence with the same FAST tokenizer used by the policy.
-4. Compute continuous-action statistics over the executed horizon, such as the first 5 or 10 actions depending on the rollout loop.
+3. Detokenize each sampled sequence with the same FAST tokenizer.
+4. Compute continuous-action statistics over the executed horizon.
 
-Do not compute continuous ACE/FIPER directly on raw FAST token IDs unless you intentionally want a token-space proxy.
+For LIBERO-style replanning, if only the first 5 continuous actions are executed, compute uncertainty over those first 5 detokenized actions. Do not assume the first 5 generated tokens equal the first 5 robot actions.
 
-## Known limitations and recommended future improvements
+## Known limitations and possible future hooks
 
-- `action_chunks` currently returns token-space chunks only. A future hook could optionally detokenize sampled chunks into continuous action arrays after JIT, inside policy/recorder code.
-- `raw_attention_weights` captures only the first generated action-token attention row. A full sequence attention hook would need to collect attention rows at every decode step, which would be much heavier.
-- `raw_attention_weights` is layer-first while `value_vectors` is batch-first. This is documented, but analysis scripts should account for it.
-- `prefix_gradients` is first-token saliency only. A chunk-level gradient objective would be more expensive but may better match action-horizon analyses.
-- `insight_metrics` are token-distribution metrics. They should not be interpreted as calibrated continuous-action uncertainty without validation.
+- `action_chunks` records token-space chunks only. A future recorder-side utility could detokenize sampled chunks after JIT and store continuous sampled actions.
+- `raw_attention_weights` captures one decode-step attention row. A full decode attention hook would need to carry attention rows through every decode step and would be much heavier.
+- `raw_attention_weights` is layer-first while `value_vectors` is batch-first. This is documented, but analysis code must account for it.
+- `prefix_gradients` is first-token saliency only. A chunk-level gradient objective would be more expensive but could better match action-horizon analyses.
+- `insight_metrics` are token-level confidence measures. They should not be interpreted as calibrated continuous-action uncertainty without validation.
+- Hook config is effectively compile-time for a jitted policy process. Restart or recompile if changing enabled hooks/config.
+
+## Validation checklist for hook outputs
+
+For a typical LIBERO-like single-example record:
+
+- `outputs/actions` should look like continuous robot actions, e.g. `[10, 7]`.
+- `action_chunks` should look like token IDs, e.g. `[num_chunks, 1, 256]`.
+- `token_spans["prefix_num_tokens"]` should match the prefix key dimension in attention/value hooks.
+- `raw_attention_weights["weights"].shape[-1]` should equal prefix token count.
+- `value_vectors["vectors"].shape[2]` should equal prefix token count.
+- `raw_attention_weights["layers"]` and `value_vectors["layers"]` should match the configured layer selection.
+- Zeros after EOS in token buffers and insight metrics are expected.
 
 ## Audit conclusion
 
-The hook implementations are technically consistent with the current pi0-fast model and with the FAST paper's conceptual model of autoregressive action-token prediction.
+The hooks are implemented correctly for the current π0-fast model and for the FAST paper's conceptual setup: an autoregressive VLA predicts compressed action-token sequences conditioned on multimodal prefix context.
 
-The most important interpretation rule is:
+The main conceptual boundary to preserve is token space vs continuous action space:
 
-```text
-pi0-fast hooks that touch actions are usually token-space hooks until the FAST tokenizer converts tokens back into continuous actions.
-```
-
-For FIPER-style analysis on LIBERO, use the hook outputs as follows:
-
-- `actions` in policy outputs: actual continuous rollout actions after detokenization.
-- `action_chunks`: alternate sampled decoded token sequences for the same observation.
-- `insight_metrics`: uncertainty/confidence for the actual decoded token sequence.
-- `raw_attention_weights`, `value_vectors`, `prefix_gradients`, and `token_spans`: model-internal tools for attributing token decisions to visual, task, and state prefix context.
+- use token hooks for model-internal autoregressive analysis,
+- detokenize sampled token chunks before computing continuous-action FIPER/ACE-style statistics,
+- use `token_spans` whenever mapping prefix-indexed tensors back to images, task text, or state text.
