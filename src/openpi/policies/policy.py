@@ -1,3 +1,6 @@
+import atexit
+import queue
+import threading
 from collections.abc import Sequence
 import logging
 import pathlib
@@ -20,6 +23,57 @@ from openpi.shared import nnx_utils
 from pi0fast_hooks.hook_runner import emit_all
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
+
+
+class _AsyncNpyWriter:
+    """Single-worker background writer for already prepared `.npy` payloads."""
+
+    def __init__(self, *, max_pending_writes: int):
+        self._queue: queue.Queue[tuple[pathlib.Path, np.ndarray] | None] = queue.Queue(
+            maxsize=max_pending_writes
+        )
+        self._error: BaseException | None = None
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._worker,
+            name="policy-recorder-npy-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, path: pathlib.Path, payload: np.ndarray) -> None:
+        self.raise_if_failed()
+        if self._closed:
+            raise RuntimeError("Cannot submit write after async writer is closed.")
+        self._queue.put((path, payload))
+
+    def close(self) -> None:
+        if self._closed:
+            self.raise_if_failed()
+            return
+
+        self._closed = True
+        self._queue.put(None)
+        self._thread.join()
+        self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("Background policy record write failed.") from self._error
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+
+                path, payload = item
+                np.save(path, payload, allow_pickle=True)
+            except BaseException as exc:  # noqa: BLE001
+                self._error = exc
+            finally:
+                self._queue.task_done()
 
 
 class Policy(BasePolicy):
@@ -137,13 +191,27 @@ class Policy(BasePolicy):
 class PolicyRecorder(_base_policy.BasePolicy):
     """Records the policy's behavior to disk."""
 
-    def __init__(self, policy: _base_policy.BasePolicy, record_dir: str):
+    def __init__(
+        self,
+        policy: _base_policy.BasePolicy,
+        record_dir: str,
+        *,
+        async_write: bool = True,
+        max_pending_writes: int = 4,
+    ):
         self._policy = policy
 
         logging.info(f"Dumping policy records to: {record_dir}")
         self._record_dir = pathlib.Path(record_dir)
         self._record_dir.mkdir(parents=True, exist_ok=True)
         self._record_step = 0
+        self._writer = (
+            _AsyncNpyWriter(max_pending_writes=max(1, max_pending_writes))
+            if async_write
+            else None
+        )
+        if self._writer is not None:
+            atexit.register(self.close)
 
     def _to_saveable(self, x):
         """
@@ -153,30 +221,55 @@ class PolicyRecorder(_base_policy.BasePolicy):
         JAX bfloat16 arrays do not always unpickle cleanly on another machine,
         so cast bfloat16 to float32 before saving.
         """
+        try:
+            x = jax.device_get(x)
+        except Exception:
+            pass
+
+        return self._to_numpy_tree(x)
+
+    def _to_numpy_tree(self, x):
+        """Convert a Python/JAX/Torch tree into NumPy leaves."""
         if isinstance(x, dict):
-            return {k: self._to_saveable(v) for k, v in x.items()}
+            return {k: self._to_numpy_tree(v) for k, v in x.items()}
 
         if isinstance(x, list):
-            return [self._to_saveable(v) for v in x]
+            return [self._to_numpy_tree(v) for v in x]
 
         if isinstance(x, tuple):
-            return tuple(self._to_saveable(v) for v in x)
+            return tuple(self._to_numpy_tree(v) for v in x)
 
         if hasattr(x, "detach") and hasattr(x, "cpu"):
             x = x.detach().cpu().numpy()
 
         try:
-            x = np.asarray(jax.device_get(x))
+            x = np.asarray(x)
         except Exception:
-            try:
-                x = np.asarray(x)
-            except Exception:
-                return x
+            return x
 
         if hasattr(x, "dtype") and str(x.dtype) == "bfloat16":
             x = x.astype(np.float32)
 
         return x
+
+    def _prepare_record_payload(self, data: dict[str, Any]) -> np.ndarray:
+        data = self._to_saveable(data)
+        data = flax.traverse_util.flatten_dict(data, sep="/")
+        return np.asarray(data, dtype=object)
+
+    def _write_record(self, output_path: pathlib.Path, payload: np.ndarray) -> None:
+        if self._writer is not None:
+            self._writer.submit(output_path, payload)
+        else:
+            np.save(
+                output_path,
+                payload,
+                allow_pickle=True,
+            )
+
+    def close(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
@@ -192,17 +285,12 @@ class PolicyRecorder(_base_policy.BasePolicy):
             "hook_records": hook_records,
         }
 
-        data = self._to_saveable(data)
-        data = flax.traverse_util.flatten_dict(data, sep="/")
+        payload = self._prepare_record_payload(data)
 
         output_path = self._record_dir / f"step_{self._record_step}.npy"
         self._record_step += 1
 
-        np.save(
-            output_path,
-            np.asarray(data, dtype=object),
-            allow_pickle=True,
-        )
+        self._write_record(output_path, payload)
 
         return results
 

@@ -63,6 +63,8 @@ def load_hook_config(path: str | None) -> dict:
                 "enabled": False,
                 "dir": None,
                 "add_timestamp": True,
+                "async_write": True,
+                "max_pending_writes": 4,
             },
             "hooks": {
                 "enabled": [],
@@ -199,7 +201,12 @@ def main(args: Args) -> None:
             args=args,
         )
 
-        policy = _policy.PolicyRecorder(policy, record_dir)
+        policy = _policy.PolicyRecorder(
+            policy,
+            record_dir,
+            async_write=bool(record_cfg.get("async_write", True)),
+            max_pending_writes=int(record_cfg.get("max_pending_writes", 4)),
+        )
         print("DEBUG: PolicyRecorder created", flush=True)
 
     hostname = socket.gethostname()

@@ -2,6 +2,8 @@ record:
   enabled: true
   dir: /nfs/roberts/scratch/pi_tkf6/as4643/policy_records
   add_timestamp: true
+  async_write: true
+  max_pending_writes: 4
 
 hooks:
   enabled:

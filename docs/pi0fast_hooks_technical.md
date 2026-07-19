@@ -156,6 +156,11 @@ The main runtime pieces are:
 Example config:
 
 ```yaml
+record:
+  enabled: true
+  async_write: true
+  max_pending_writes: 4
+
 hooks:
   enabled:
     - observation_input
@@ -186,6 +191,27 @@ Layer selection semantics:
 - `layers: [1, 16]` means only those layer indices.
 
 Because hook checks happen inside a jitted `sample_actions` path, hook configuration should be set before policy creation / first inference. Treat it as compile-time configuration for a given policy process.
+
+## Recording performance
+
+Hook records can be large, especially when saving hidden states, gradients, raw attention, and value vectors. To keep policy inference from blocking on every disk write, `PolicyRecorder` supports asynchronous `.npy` writes:
+
+```yaml
+record:
+  async_write: true
+  max_pending_writes: 4
+```
+
+This does not change the final `.npy` payload. The recorder still saves one `step_N.npy` file containing the same flattened dictionary of inputs, outputs, and hook records. The optimization only moves the blocking `np.save(...)` call onto a single background thread.
+
+Operational semantics:
+
+- `async_write: true` lets inference return after the record payload is prepared and queued.
+- `max_pending_writes` bounds memory growth. If disk is slower than inference for long enough, inference will eventually block until the writer catches up.
+- The writer is flushed on `PolicyRecorder.close()` and through an `atexit` handler for normal process shutdown.
+- If a background write fails, the next submit/close raises a `RuntimeError` with the original write error attached.
+
+Use `async_write: false` if a script needs each `.npy` file to be fully written before `infer(...)` returns.
 
 ## Shared notation and shapes
 
