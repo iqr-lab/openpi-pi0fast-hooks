@@ -42,6 +42,7 @@ class Args:
     num_trials_per_task: int = 50  # Number of rollouts per task
     max_episodes: Optional[int] = None  # If set, select this many episodes total, balanced across base
     # tasks, perturbation categories, and difficulty levels (per task_classification.json)
+    exclude_language_variations: bool = False  # For LIBERO-Plus, skip *_language_* / Language Instructions tasks
 
     #################################################################################################################
     # Utils
@@ -62,6 +63,15 @@ class Args:
 _VARIATION_SUFFIX_RE = re.compile(
     r"(_view_[\d_-]+_initstate_\d+|_(table|tb)_\d+|_initstate_\d+|_level\d+_sample\d+|_add_\d+|_light_\d+|_noise_\d+|_language_\d+)$"
 )
+
+
+def _is_language_variation(name: str, category: Optional[str] = None) -> bool:
+    """Returns True for LIBERO-Plus language-instruction variation tasks."""
+    if "_language_" in name:
+        return True
+    if category is not None and category.strip().lower() == "language instructions":
+        return True
+    return False
 
 
 def _base_task_name(name: str) -> str:
@@ -139,13 +149,23 @@ def _get_task_metadata(task_suite, suite_name: str) -> List[Dict]:
         task = task_suite.get_task(task_id)
         entry = by_name.get(task.name)
         if entry is None:
-            metadata.append({"base": task.name, "category": "default", "difficulty": 0})
+            metadata.append(
+                {
+                    "name": task.name,
+                    "base": task.name,
+                    "category": "default",
+                    "difficulty": 0,
+                    "is_language_variation": _is_language_variation(task.name),
+                }
+            )
         else:
             metadata.append(
                 {
+                    "name": entry["name"],
                     "base": _base_task_name(entry["name"]),
                     "category": entry["category"],
                     "difficulty": entry["difficulty_level"],
+                    "is_language_variation": _is_language_variation(entry["name"], entry["category"]),
                 }
             )
     return metadata
@@ -255,17 +275,32 @@ def eval_libero(args: Args) -> None:
     # When resuming from a combined summary file, the server-side recorder must also continue in
     # the same record directory for these indices to refer to one contiguous step_*.npy sequence.
 
+    task_metadata = _get_task_metadata(task_suite, args.task_suite_name)
+    eligible_task_ids = [
+        task_id
+        for task_id, metadata in enumerate(task_metadata)
+        if not (args.exclude_language_variations and metadata["is_language_variation"])
+    ]
+
+    if args.exclude_language_variations:
+        n_excluded = num_tasks_in_suite - len(eligible_task_ids)
+        logging.info(f"Excluding {n_excluded} LIBERO-Plus language-variation tasks.")
+
     # Pre-compute how many episodes to run per task. If max_episodes is set, distribute the
     # episode budget so that base tasks, perturbation categories, and difficulty levels (per
     # task_classification.json) are all covered as evenly as possible. Otherwise run
     # num_trials_per_task episodes for every task, as before.
+    episode_counts = np.zeros(num_tasks_in_suite, dtype=int)
     if args.max_episodes is not None:
-        task_metadata = _get_task_metadata(task_suite, args.task_suite_name)
-        episode_counts = _select_episode_counts(
-            task_metadata, args.max_episodes, args.num_trials_per_task, args.seed
+        selected_counts = _select_episode_counts(
+            [task_metadata[task_id] for task_id in eligible_task_ids],
+            args.max_episodes,
+            args.num_trials_per_task,
+            args.seed,
         )
+        episode_counts[np.asarray(eligible_task_ids, dtype=int)] = selected_counts
     else:
-        episode_counts = np.full(num_tasks_in_suite, args.num_trials_per_task, dtype=int)
+        episode_counts[np.asarray(eligible_task_ids, dtype=int)] = args.num_trials_per_task
 
     # Start evaluation
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
