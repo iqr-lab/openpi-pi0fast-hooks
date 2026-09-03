@@ -4,6 +4,12 @@ record:
   add_timestamp: true
   async_write: true
   max_pending_writes: 4
+  # Compressed record container (step_*.pirec). Set compress: false for legacy step_*.npy.
+  compress: true
+  float_dtype: auto      # auto (lossless) | bf16 | f16 | fp8_e4m3 | none
+  codec: zstd            # zstd | zlib
+  level: 19
+  shuffle: true
 
 hooks:
   enabled:

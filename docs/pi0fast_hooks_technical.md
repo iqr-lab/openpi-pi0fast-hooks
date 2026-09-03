@@ -194,7 +194,7 @@ Because hook checks happen inside a jitted `sample_actions` path, hook configura
 
 ## Recording performance
 
-Hook records can be large, especially when saving hidden states, gradients, raw attention, and value vectors. To keep policy inference from blocking on every disk write, `PolicyRecorder` supports asynchronous `.npy` writes:
+Hook records can be large, especially when saving hidden states, gradients, raw attention, and value vectors. To keep policy inference from blocking on every disk write, `PolicyRecorder` supports asynchronous writes:
 
 ```yaml
 record:
@@ -202,7 +202,7 @@ record:
   max_pending_writes: 4
 ```
 
-This does not change the final `.npy` payload. The recorder still saves one `step_N.npy` file containing the same flattened dictionary of inputs, outputs, and hook records. The optimization only moves the blocking `np.save(...)` call onto a single background thread.
+This does not change record contents. The recorder still saves one file per `infer(...)` call containing the same flattened dictionary of inputs, outputs, and hook records. The optimization moves both encoding and the blocking write onto a single background thread.
 
 Operational semantics:
 
@@ -211,7 +211,34 @@ Operational semantics:
 - The writer is flushed on `PolicyRecorder.close()` and through an `atexit` handler for normal process shutdown.
 - If a background write fails, the next submit/close raises a `RuntimeError` with the original write error attached.
 
-Use `async_write: false` if a script needs each `.npy` file to be fully written before `infer(...)` returns.
+Use `async_write: false` if a script needs each record file to be fully written before `infer(...)` returns.
+
+### Record compression
+
+Records are written as `step_N.pirec`, a compressed container (see `openpi.policies.record_io`). Each array is narrowed in dtype, byte-shuffled so exponent bytes group together, then compressed:
+
+```yaml
+record:
+  compress: true
+  float_dtype: auto      # auto (lossless) | bf16 | f16 | fp8_e4m3 | none
+  codec: zstd            # zstd | zlib
+  level: 19
+  shuffle: true
+```
+
+`float_dtype: auto` is lossless: float32 is stored as bfloat16 only when the round-trip is bit-exact, which covers every tensor the model produced in bfloat16 and the recorder widened. `bf16`, `f16` and `fp8_e4m3` force narrowing and are lossy for genuine float32 data. Arrays are always returned in their original dtype on load, so analysis code is unaffected.
+
+Typical result with `float_dtype: auto`: about 2.8x smaller than the equivalent `.npy`. `fp8_e4m3` reaches roughly 4.4x at reduced precision.
+
+Set `compress: false` to fall back to legacy `step_N.npy` files.
+
+Read records with `record_io.load_record(path)`, which accepts both `.pirec` and legacy `.npy`:
+
+```python
+from openpi.policies import record_io
+
+record = record_io.load_record(record_dir / "step_0.pirec")
+```
 
 ## Shared notation and shapes
 

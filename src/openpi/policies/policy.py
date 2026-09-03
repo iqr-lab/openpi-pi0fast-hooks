@@ -20,28 +20,34 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
+from openpi.policies import record_io
 from pi0fast_hooks.hook_runner import emit_all
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
 
-class _AsyncNpyWriter:
-    """Single-worker background writer for already prepared `.npy` payloads."""
+class _AsyncRecordWriter:
+    """Single-worker background writer for prepared record payloads.
 
-    def __init__(self, *, max_pending_writes: int):
-        self._queue: queue.Queue[tuple[pathlib.Path, np.ndarray] | None] = queue.Queue(
+    Encoding (dtype narrowing, byte shuffle, compression) happens on the worker
+    thread so it never blocks the inference thread.
+    """
+
+    def __init__(self, *, max_pending_writes: int, encode):
+        self._encode = encode
+        self._queue: queue.Queue[tuple[pathlib.Path, dict] | None] = queue.Queue(
             maxsize=max_pending_writes
         )
         self._error: BaseException | None = None
         self._closed = False
         self._thread = threading.Thread(
             target=self._worker,
-            name="policy-recorder-npy-writer",
+            name="policy-recorder-writer",
             daemon=True,
         )
         self._thread.start()
 
-    def submit(self, path: pathlib.Path, payload: np.ndarray) -> None:
+    def submit(self, path: pathlib.Path, payload: dict) -> None:
         self.raise_if_failed()
         if self._closed:
             raise RuntimeError("Cannot submit write after async writer is closed.")
@@ -69,7 +75,7 @@ class _AsyncNpyWriter:
                     return
 
                 path, payload = item
-                np.save(path, payload, allow_pickle=True)
+                self._encode(path, payload)
             except BaseException as exc:  # noqa: BLE001
                 self._error = exc
             finally:
@@ -198,6 +204,11 @@ class PolicyRecorder(_base_policy.BasePolicy):
         *,
         async_write: bool = True,
         max_pending_writes: int = 4,
+        compress: bool = True,
+        float_dtype: str = "auto",
+        codec: str = "zstd",
+        level: int = 19,
+        shuffle: bool = True,
     ):
         self._policy = policy
 
@@ -205,8 +216,23 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_dir = pathlib.Path(record_dir)
         self._record_dir.mkdir(parents=True, exist_ok=True)
         self._record_step = 0
+        self._compress = compress
+        self._encode_kwargs = {
+            "float_dtype": float_dtype,
+            "codec": codec,
+            "level": level,
+            "shuffle": shuffle,
+        }
+        if compress:
+            logging.info(
+                "Policy records are compressed: "
+                f"float_dtype={float_dtype} codec={codec} level={level} shuffle={shuffle}"
+            )
         self._writer = (
-            _AsyncNpyWriter(max_pending_writes=max(1, max_pending_writes))
+            _AsyncRecordWriter(
+                max_pending_writes=max(1, max_pending_writes),
+                encode=self._encode_to_disk,
+            )
             if async_write
             else None
         )
@@ -252,20 +278,25 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         return x
 
-    def _prepare_record_payload(self, data: dict[str, Any]) -> np.ndarray:
+    def _prepare_record_payload(self, data: dict[str, Any]) -> dict[str, Any]:
         data = self._to_saveable(data)
-        data = flax.traverse_util.flatten_dict(data, sep="/")
-        return np.asarray(data, dtype=object)
+        return flax.traverse_util.flatten_dict(data, sep="/")
 
-    def _write_record(self, output_path: pathlib.Path, payload: np.ndarray) -> None:
+    def _encode_to_disk(self, output_path: pathlib.Path, payload: dict[str, Any]) -> None:
+        """Serialize one record. Runs on the writer thread when async."""
+        if self._compress:
+            blob = record_io.encode_record(payload, **self._encode_kwargs)
+            tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+            tmp_path.write_bytes(blob)
+            tmp_path.replace(output_path)
+        else:
+            np.save(output_path, np.asarray(payload, dtype=object), allow_pickle=True)
+
+    def _write_record(self, output_path: pathlib.Path, payload: dict[str, Any]) -> None:
         if self._writer is not None:
             self._writer.submit(output_path, payload)
         else:
-            np.save(
-                output_path,
-                payload,
-                allow_pickle=True,
-            )
+            self._encode_to_disk(output_path, payload)
 
     def close(self) -> None:
         if self._writer is not None:
@@ -287,7 +318,8 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         payload = self._prepare_record_payload(data)
 
-        output_path = self._record_dir / f"step_{self._record_step}.npy"
+        suffix = record_io.FILE_SUFFIX if self._compress else ".npy"
+        output_path = self._record_dir / f"step_{self._record_step}{suffix}"
         self._record_step += 1
 
         self._write_record(output_path, payload)

@@ -271,9 +271,9 @@ def eval_libero(args: Args) -> None:
 
     total_episodes = len(episode_summaries)
     total_successes = sum(1 for summary in episode_summaries if summary.get("success", False))
-    # infer_global_idx increments once per client.infer(...), matching step_*.npy numbering.
+    # infer_global_idx increments once per client.infer(...), matching step_* record numbering.
     # When resuming from a combined summary file, the server-side recorder must also continue in
-    # the same record directory for these indices to refer to one contiguous step_*.npy sequence.
+    # the same record directory for these indices to refer to one contiguous step_* sequence.
 
     task_metadata = _get_task_metadata(task_suite, args.task_suite_name)
     eligible_task_ids = [
@@ -405,7 +405,7 @@ def eval_libero(args: Args) -> None:
 
                 except Exception as e:
                     # Don't reconnect and continue: a lost connection means the server may have
-                    # already produced a step_*.npy for a request we never got a response to,
+                    # already produced a step_* record for a request we never got a response to,
                     # which desyncs infer_global_idx from the server's own step counter for every
                     # subsequent recording. Fail loudly instead of silently corrupting indices.
                     logging.error(f"Caught exception: {e}")
