@@ -222,7 +222,7 @@ record:
   compress: true
   float_dtype: auto      # auto (lossless) | bf16 | f16 | fp8_e4m3 | none
   codec: zstd            # zstd | zlib
-  level: 19
+  level: 1
   shuffle: true
 ```
 

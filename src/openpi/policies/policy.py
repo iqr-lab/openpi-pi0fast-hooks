@@ -207,7 +207,7 @@ class PolicyRecorder(_base_policy.BasePolicy):
         compress: bool = True,
         float_dtype: str = "auto",
         codec: str = "zstd",
-        level: int = 19,
+        level: int = 1,
         shuffle: bool = True,
     ):
         self._policy = policy
@@ -273,7 +273,10 @@ class PolicyRecorder(_base_policy.BasePolicy):
         except Exception:
             return x
 
-        if hasattr(x, "dtype") and str(x.dtype) == "bfloat16":
+        if hasattr(x, "dtype") and str(x.dtype) == "bfloat16" and not self._compress:
+            # The compressed container stores bfloat16 natively and load_record
+            # widens it back to float32, so this cast is only needed for .npy,
+            # where bfloat16 does not always unpickle on another machine.
             x = x.astype(np.float32)
 
         return x

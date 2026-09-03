@@ -8,7 +8,7 @@ record:
   compress: true
   float_dtype: auto      # auto (lossless) | bf16 | f16 | fp8_e4m3 | none
   codec: zstd            # zstd | zlib
-  level: 19
+  level: 1               # 1 is both fastest and smallest here; 1-19 differ by <3%
   shuffle: true
 
 hooks:

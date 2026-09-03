@@ -128,7 +128,7 @@ def encode_record(
     *,
     float_dtype: str = "auto",
     codec: str = "zstd",
-    level: int = 19,
+    level: int = 1,
     shuffle: bool = True,
 ) -> bytes:
     """Serialize a flattened record dict into one compressed container blob."""
@@ -184,8 +184,13 @@ def encode_record(
     return b"".join([MAGIC, _HEADER_LEN.pack(len(header)), header, *blobs])
 
 
-def decode_record(blob: bytes) -> dict[str, Any]:
-    """Inverse of :func:`encode_record`."""
+def decode_record(blob: bytes, *, widen_bfloat16: bool = True) -> dict[str, Any]:
+    """Inverse of :func:`encode_record`.
+
+    ``widen_bfloat16`` returns bfloat16 arrays as float32, matching what the
+    recorder produced before records were compressed. Pass ``False`` to get the
+    stored bfloat16 back and avoid the widening copy.
+    """
     if not blob.startswith(MAGIC):
         raise ValueError("Not a policy record container (bad magic).")
 
@@ -220,14 +225,18 @@ def decode_record(blob: bytes) -> dict[str, Any]:
         orig_dtype = entry.get("orig_dtype")
         if orig_dtype is not None and np.dtype(orig_dtype) != arr.dtype:
             arr = arr.astype(orig_dtype)
+        if widen_bfloat16 and arr.dtype == ml_dtypes.bfloat16:
+            arr = arr.astype(np.float32)
         out[entry["key"]] = arr
 
     return out
 
 
-def load_record(path: str | pathlib.Path) -> dict[str, Any]:
+def load_record(
+    path: str | pathlib.Path, *, widen_bfloat16: bool = True
+) -> dict[str, Any]:
     """Load a record, transparently handling legacy ``.npy`` files."""
     path = pathlib.Path(path)
     if path.suffix == ".npy":
         return np.load(path, allow_pickle=True).item()
-    return decode_record(path.read_bytes())
+    return decode_record(path.read_bytes(), widen_bfloat16=widen_bfloat16)

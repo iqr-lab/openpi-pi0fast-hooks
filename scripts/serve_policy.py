@@ -68,7 +68,7 @@ def load_hook_config(path: str | None) -> dict:
                 "compress": True,
                 "float_dtype": "auto",
                 "codec": "zstd",
-                "level": 19,
+                "level": 1,
                 "shuffle": True,
             },
             "hooks": {
@@ -214,7 +214,7 @@ def main(args: Args) -> None:
             compress=bool(record_cfg.get("compress", True)),
             float_dtype=str(record_cfg.get("float_dtype", "auto")),
             codec=str(record_cfg.get("codec", "zstd")),
-            level=int(record_cfg.get("level", 19)),
+            level=int(record_cfg.get("level", 1)),
             shuffle=bool(record_cfg.get("shuffle", True)),
         )
         print("DEBUG: PolicyRecorder created", flush=True)
