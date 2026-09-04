@@ -82,6 +82,8 @@ def load_hook_config(path: str | None) -> dict:
                 "codec": "zstd",
                 "level": 1,
                 "shuffle": True,
+                "writer_threads": 1,
+                "log_every": 0,
             },
             "hooks": {
                 "enabled": [],
@@ -228,6 +230,8 @@ def main(args: Args) -> None:
             codec=str(record_cfg.get("codec", "zstd")),
             level=int(record_cfg.get("level", 1)),
             shuffle=bool(record_cfg.get("shuffle", True)),
+            writer_threads=int(record_cfg.get("writer_threads", 1)),
+            log_every=int(record_cfg.get("log_every", 0)),
         )
         print("DEBUG: PolicyRecorder created", flush=True)
 

@@ -10,6 +10,8 @@ record:
   codec: zstd            # zstd | zlib
   level: 1               # 1 is both fastest and smallest here; 1-19 differ by <3%
   shuffle: true
+  writer_threads: 1        # raise to 2-4 if writes to a network filesystem lag inference
+  log_every: 100           # log encode/write/queue-block timing every N records; 0 disables
 
 hooks:
   enabled:
