@@ -214,6 +214,25 @@ def encode_record(
     return b"".join([MAGIC, _HEADER_LEN.pack(len(header)), header, *blobs])
 
 
+def _widen_bfloat16_tree(value: Any) -> Any:
+    """Widen every bfloat16 array inside a decoded pickle leaf to float32.
+
+    Arrays stored as their own container entries are widened by
+    :func:`decode_record` directly. Containers such as ``hook_records`` reach us
+    as one pickled leaf, so their arrays need the same treatment to keep the
+    dtype a caller sees consistent across the whole record.
+    """
+    if isinstance(value, np.ndarray):
+        return value.astype(np.float32) if value.dtype == ml_dtypes.bfloat16 else value
+    if isinstance(value, dict):
+        return {k: _widen_bfloat16_tree(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_widen_bfloat16_tree(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_widen_bfloat16_tree(v) for v in value)
+    return value
+
+
 def decode_record(blob: bytes, *, widen_bfloat16: bool = True) -> dict[str, Any]:
     """Inverse of :func:`encode_record`.
 
@@ -238,7 +257,8 @@ def decode_record(blob: bytes, *, widen_bfloat16: bool = True) -> dict[str, Any]
         offset += entry["nbytes"]
 
         if entry["kind"] == "pickle":
-            out[entry["key"]] = pickle.loads(payload)
+            unpickled = pickle.loads(payload)
+            out[entry["key"]] = _widen_bfloat16_tree(unpickled) if widen_bfloat16 else unpickled
             continue
 
         itemsize = entry["itemsize"]
