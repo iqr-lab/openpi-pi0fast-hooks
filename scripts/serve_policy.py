@@ -49,10 +49,22 @@ class Args:
 
 
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
-    EnvMode.ALOHA: Checkpoint("pi05_aloha", "gs://openpi-assets/checkpoints/pi05_base"),
-    EnvMode.ALOHA_SIM: Checkpoint("pi0_aloha_sim", "gs://openpi-assets/checkpoints/pi0_aloha_sim"),
-    EnvMode.DROID: Checkpoint("pi05_droid", "gs://openpi-assets/checkpoints/pi05_droid"),
-    EnvMode.LIBERO: Checkpoint("pi05_libero", "gs://openpi-assets/checkpoints/pi05_libero"),
+    EnvMode.ALOHA: Checkpoint(
+        config="pi05_aloha",
+        dir="gs://openpi-assets/checkpoints/pi05_base",
+    ),
+    EnvMode.ALOHA_SIM: Checkpoint(
+        config="pi0_aloha_sim",
+        dir="gs://openpi-assets/checkpoints/pi0_aloha_sim",
+    ),
+    EnvMode.DROID: Checkpoint(
+        config="pi05_droid",
+        dir="gs://openpi-assets/checkpoints/pi05_droid",
+    ),
+    EnvMode.LIBERO: Checkpoint(
+        config="pi05_libero",
+        dir="gs://openpi-assets/checkpoints/pi05_libero",
+    ),
 }
 
 
