@@ -50,6 +50,12 @@ FILE_SUFFIX = ".pirec"
 #   none      no narrowing.
 FLOAT_DTYPES = ("auto", "none", "bf16", "f16", "fp8_e4m3")
 
+# Float dtypes the narrowing step will act on.
+_NARROWABLE = frozenset(
+    np.dtype(d)
+    for d in (np.float64, np.float32, np.float16, ml_dtypes.bfloat16)
+)
+
 _NARROW = {
     "bf16": ml_dtypes.bfloat16,
     "f16": np.float16,
@@ -62,6 +68,23 @@ _VIEW_DTYPE = {
     "bfloat16": np.uint16,
     "float8_e4m3fn": np.uint8,
 }
+
+
+def _dtype_key(dt: np.dtype) -> str:
+    """Header name for a dtype: ml_dtypes types by name, others by ``dtype.str``.
+
+    ``dtype.str`` is used for numpy-native types because it round-trips widths
+    that ``dtype.name`` cannot (e.g. "<U8"). It is not usable for ml_dtypes
+    types, whose ``.str`` is an opaque void code such as "<V2".
+    """
+    return dt.name if dt.name in _VIEW_DTYPE else dt.str
+
+
+def _resolve_dtype(key: str) -> np.dtype:
+    """Inverse of :func:`_dtype_key`."""
+    if key in _VIEW_DTYPE:
+        return np.dtype(getattr(ml_dtypes, key))
+    return np.dtype(key)
 
 
 def _resolve_codec(name: str):
@@ -105,11 +128,14 @@ def _unshuffle(buf: bytes, itemsize: int) -> bytes:
 
 def _narrow(arr: np.ndarray, float_dtype: str) -> np.ndarray:
     """Apply the configured dtype narrowing to one array."""
-    if float_dtype == "none" or arr.dtype not in (np.float32, np.float64):
+    if float_dtype == "none" or arr.dtype not in _NARROWABLE:
         return arr
 
     if float_dtype == "auto":
         # Lossless only: keep the narrowed copy when it round-trips exactly.
+        # Anything already at bfloat16 or narrower is left alone.
+        if arr.dtype.itemsize <= 2:
+            return arr
         narrowed = arr.astype(ml_dtypes.bfloat16)
         if np.array_equal(narrowed.astype(arr.dtype), arr):
             return narrowed
@@ -120,7 +146,16 @@ def _narrow(arr: np.ndarray, float_dtype: str) -> np.ndarray:
         raise ValueError(
             f"float_dtype {float_dtype!r} is not supported by the installed ml_dtypes."
         )
-    return arr.astype(target)
+
+    # Never widen, and never trade one 16-bit float for another: the model
+    # already emits bfloat16, so casting it to float16 costs range for no bytes.
+    if np.dtype(target).itemsize >= arr.dtype.itemsize:
+        return arr
+
+    # Values outside the target's range saturate to inf. That is the documented
+    # cost of an explicit lossy setting, so don't warn once per array per step.
+    with np.errstate(over="ignore"):
+        return arr.astype(target)
 
 
 def encode_record(
@@ -146,14 +181,9 @@ def encode_record(
             # only call it when the array is actually non-contiguous.
             arr = value if value.flags.c_contiguous else np.ascontiguousarray(value)
             arr = _narrow(arr, float_dtype)
-            if arr.dtype.name in _VIEW_DTYPE:
-                # ml_dtypes types are stored as same-width unsigned ints.
-                store_dtype = arr.dtype.name
-                raw = arr.view(_VIEW_DTYPE[store_dtype])
-            else:
-                # dtype.str round-trips widths that dtype.name cannot (e.g. "<U8").
-                store_dtype = arr.dtype.str
-                raw = arr
+            store_dtype = _dtype_key(arr.dtype)
+            # ml_dtypes types are stored as same-width unsigned ints.
+            raw = arr.view(_VIEW_DTYPE[store_dtype]) if store_dtype in _VIEW_DTYPE else arr
             buf = raw.tobytes()
             use_shuffle = shuffle and raw.dtype.itemsize > 1
             blob = compress(_shuffle(buf, raw.dtype.itemsize) if use_shuffle else buf, level)
@@ -163,7 +193,7 @@ def encode_record(
                 "dtype": store_dtype,
                 # Narrowing is a storage detail: load_record hands back the
                 # dtype the recorder produced, so analysis code is unaffected.
-                "orig_dtype": value.dtype.str,
+                "orig_dtype": _dtype_key(value.dtype),
                 "shape": list(arr.shape),
                 "itemsize": int(raw.dtype.itemsize),
                 "shuffle": use_shuffle,
@@ -223,8 +253,10 @@ def decode_record(blob: bytes, *, widen_bfloat16: bool = True) -> dict[str, Any]
         arr = arr.reshape(entry["shape"])
 
         orig_dtype = entry.get("orig_dtype")
-        if orig_dtype is not None and np.dtype(orig_dtype) != arr.dtype:
-            arr = arr.astype(orig_dtype)
+        if orig_dtype is not None:
+            target = _resolve_dtype(orig_dtype)
+            if target != arr.dtype:
+                arr = arr.astype(target)
         if widen_bfloat16 and arr.dtype == ml_dtypes.bfloat16:
             arr = arr.astype(np.float32)
         out[entry["key"]] = arr

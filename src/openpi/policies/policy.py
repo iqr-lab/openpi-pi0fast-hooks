@@ -245,7 +245,9 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
         Important:
         JAX bfloat16 arrays do not always unpickle cleanly on another machine,
-        so cast bfloat16 to float32 before saving.
+        so they are widened to float32 for legacy `.npy` output. The compressed
+        container stores bfloat16 natively instead and `record_io.load_record`
+        widens on read, so the cast is skipped when compression is on.
         """
         try:
             x = jax.device_get(x)
