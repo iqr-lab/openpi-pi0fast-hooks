@@ -262,7 +262,6 @@ prefix_gradients:           [B, P, D]
 action_chunks:              [num_chunks, B, T]
 insight metric fields:      [B, T]
 raw attention weights:      [L_selected, B, H, P]
-raw attention v_cache:      [L_selected, B, P, KVH, HD]
 value vectors:              [B, L_selected, P, KVH, HD]
 ```
 
@@ -597,7 +596,6 @@ Captures:
 ```python
 {
     "weights": attn_weights,
-    "v_cache": selected_v_cache,
     "layers": layer_indices,
     "key_len": key_len,
     "num_heads": num_heads,
@@ -610,7 +608,6 @@ Expected shapes:
 
 ```text
 weights: [L_selected, B, H, P]
-v_cache: [L_selected, B, P, KVH, HD]
 ```
 
 Conceptual meaning:
@@ -660,7 +657,7 @@ Caveats:
 
 - Attention weights are routing probabilities, not causal explanations.
 - This is a first-decode-step hook, not full-sequence attention.
-- It includes `v_cache` in layer-first form, duplicating part of the dedicated `value_vectors` hook. Prefer `value_vectors` for value-vector analyses.
+- It records attention weights only. The prefix value vectors come from the dedicated `value_vectors` hook, which owns them in batch-major form with the matching `num_kv_heads`/`head_dim` metadata. Pairing weights with values therefore requires enabling `value_vectors` as well, with a `layers` selection covering the one used here.
 
 ## Hook: `value_vectors`
 
