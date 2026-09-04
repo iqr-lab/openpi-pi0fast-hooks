@@ -1,9 +1,9 @@
 import atexit
-import queue
-import threading
 from collections.abc import Sequence
 import logging
 import pathlib
+import queue
+import threading
 import time
 from typing import Any, TypeAlias
 
@@ -18,9 +18,9 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.policies import record_io
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
-from openpi.policies import record_io
 from pi0fast_hooks.hook_runner import emit_all
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
